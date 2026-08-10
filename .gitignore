@@ -50,6 +50,13 @@ Thumbs.db
 desktop.ini
 
 # ---------------------------------------------------------------------------
+# Superseded docs kept locally for reference
+# ---------------------------------------------------------------------------
+# The pre-GitHub README. Kept on disk to crib from; the repo gets a fresh
+# README.md written from scratch, which IS committed.
+documentation/oldReadme.md
+
+# ---------------------------------------------------------------------------
 # Scratch files
 # ---------------------------------------------------------------------------
 _probe*.py

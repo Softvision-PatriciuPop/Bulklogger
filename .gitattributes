@@ -1,2 +1,16 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must keep LF even on a Windows checkout. With CRLF, bash fails
+# with a bare "\r: command not found" that gives no hint at the real cause.
+*.sh text eol=lf
+
+# Batch and PowerShell are the other way round.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Never line-ending-normalise binaries.
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary

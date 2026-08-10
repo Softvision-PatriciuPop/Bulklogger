@@ -16,6 +16,11 @@ retired = []
 [groups]
 # Replace with your real goals. A label can be anything - the parent key is a
 # useful prefix when the children are subtasks of one tracking issue.
-"QATT · Test automation" = [
-  "QATT-85",
-]
+"QA Automation" = ["QATT-121","QATT-117"]
+"Meetings" = ["QATT-85","QATT-86"]
+"Training and Ramp-up" = ["QATT-83",]
+"Administrative and Leading Work" = ["QATT-82",]
+"Other Work" = ["QATT-81","QATT-80"]
+"Nimbus" = ["QATT-77","QATT-78"]
+"Experiments and Rollouts" = ["QATT-69","QATT-70","QATT-71","QATT-72","QATT-73","QATT-74","QATT-75","QATT-76",]
+"Features" = ["QATT-59","QATT-60","QATT-61","QATT-62","QATT-63","QATT-64","QATT-65","QATT-66","QATT-67",]

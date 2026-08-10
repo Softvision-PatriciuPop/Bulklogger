@@ -89,7 +89,9 @@ jobs:
         run: |
           $stage = "Bulklogger-${{ steps.version.outputs.value }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item dist\Bulklogger.exe, dist\tickets.toml, credentials.toml.example, README.md $stage
+          Copy-Item dist\Bulklogger.exe, dist\tickets.toml, credentials.toml.example $stage
+          # README is optional so a release still builds before one is written
+          if (Test-Path README.md) { Copy-Item README.md $stage }
           Compress-Archive -Force -Path $stage -DestinationPath "$stage-windows.zip"
 
       # ditto, not zip: it preserves the bundle's symlinks and executable bits,
@@ -100,7 +102,9 @@ jobs:
           stage="Bulklogger-${{ steps.version.outputs.value }}"
           mkdir -p "$stage"
           cp -R dist/Bulklogger.app "$stage"/
-          cp dist/tickets.toml credentials.toml.example README.md "$stage"/
+          cp dist/tickets.toml credentials.toml.example "$stage"/
+          # README is optional so a release still builds before one is written
+          if [ -f README.md ]; then cp README.md "$stage"/; fi
           ditto -c -k --sequesterRsrc --keepParent "$stage" "$stage-macos.zip"
 
       - uses: actions/upload-artifact@v4
