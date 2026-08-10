@@ -1,0 +1,159 @@
+# Builds Bulklogger for Windows and macOS, and publishes them as a release.
+#
+# PyInstaller cannot cross-compile, so each binary is built on its own runner.
+# This is how to get a macOS build without owning a Mac.
+#
+# Every push builds both and leaves them as downloadable artifacts.
+# To cut a release, either:
+#   * push a tag:  git tag v1.0.0 && git push origin v1.0.0
+#   * or run this workflow from the Actions tab and fill in the version box.
+
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, e.g. v1.0.0. Leave blank to only build."
+        required: false
+        default: ""
+
+permissions:
+  contents: write # needed to create the release
+
+jobs:
+  test:
+    # The GUI tests create real Tk windows, so they need a desktop session.
+    # The Windows runner has one; ubuntu would need a virtual display.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest test_bulklogger test_app
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+
+      - name: Work out the version label
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/*) VERSION="$GITHUB_REF_NAME" ;;
+              *)           VERSION="dev-${GITHUB_SHA::7}" ;;
+            esac
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      # Ship the executable and the shared config, and nothing else. Personal
+      # files are stripped by the build scripts; a CI runner never creates one,
+      # but the explicit file list is the real guarantee.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "Bulklogger-${{ steps.version.outputs.value }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item dist\Bulklogger.exe, dist\tickets.toml, credentials.toml.example, README.md $stage
+          Compress-Archive -Force -Path $stage -DestinationPath "$stage-windows.zip"
+
+      # ditto, not zip: it preserves the bundle's symlinks and executable bits,
+      # which a plain zip mangles and Gatekeeper then rejects outright.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          stage="Bulklogger-${{ steps.version.outputs.value }}"
+          mkdir -p "$stage"
+          cp -R dist/Bulklogger.app "$stage"/
+          cp dist/tickets.toml credentials.toml.example README.md "$stage"/
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "$stage-macos.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bulklogger-${{ matrix.name }}
+          path: Bulklogger-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # only on a tag push, or a manual run with the version box filled in
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # A quoted heredoc, so nothing in the notes needs shell escaping.
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## Install
+
+          **Windows** — unzip and run `Bulklogger.exe`. Keep `tickets.toml` in the
+          same folder.
+
+          **macOS** — unzip, then **right-click → Open** `Bulklogger.app` the first
+          time. The app is unsigned, so a plain double-click is blocked by
+          Gatekeeper. Keep `tickets.toml` in the same folder as the app.
+
+          On first run you are asked for your email and a Jira API token, created
+          at id.atlassian.com → Security → API tokens. It is saved to
+          `credentials.toml` next to the app.
+
+          `credentials.toml` is personal to you — never share it or commit it. If
+          it is ever exposed, revoke the token and use **Sign out** to enter a new
+          one.
+
+          Edit `tickets.toml` to list the goal tickets you log against.
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.version }}"
+          [ -z "$TAG" ] && TAG="$GITHUB_REF_NAME"
+          ls -la artifacts
+          gh release create "$TAG" artifacts/*.zip \
+            --title "Bulklogger $TAG" \
+            --notes-file notes.md

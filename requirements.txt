@@ -1,0 +1,11 @@
+# Bulklogger runtime dependencies.
+#     pip install -r requirements.txt
+#
+# Tkinter is not listed: it ships with the official Python installer on
+# Windows and macOS. On Debian/Ubuntu install it with `apt install python3-tk`.
+
+requests>=2.31
+
+# Windows ships no IANA time zone database, so zoneinfo cannot resolve
+# "Europe/Bucharest" without this. Harmless on Linux and macOS.
+tzdata>=2024.1

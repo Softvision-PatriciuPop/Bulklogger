@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Secrets and personal state - NEVER COMMIT
+# ---------------------------------------------------------------------------
+# credentials.toml holds a Jira API token in plain text. Running the app from
+# any folder writes these three next to the executable, so they turn up in
+# build and packaging directories, not just here.
+credentials.toml
+**/credentials.toml
+draft.json
+**/draft.json
+usage.json
+**/usage.json
+
+# Hand-made distribution folders and archives. These are copies of dist\ made
+# to hand out, which means they can easily contain a credentials.toml.
+*.zip
+*.rar
+*.7z
+*.tar.gz
+*.dmg
+JBulklogger*/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build/
+dist/
+# PyInstaller writes this itself; the flags live in build.ps1 / build.sh
+*.spec
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Editors and OS cruft
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Scratch files
+# ---------------------------------------------------------------------------
+_probe*.py
+_demo*.py
+_shot*.png
+_err.txt
+*.tmp

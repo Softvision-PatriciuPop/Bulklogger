@@ -1,0 +1,10 @@
+# Everything in requirements.txt, plus what is needed to build the .exe.
+#     pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pyinstaller>=6.0
+
+# Only needed to regenerate bulklogger.ico from the source artwork. The .ico is
+# committed, so a normal build does not need this.
+Pillow>=10.0
