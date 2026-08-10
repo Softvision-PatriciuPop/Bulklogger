@@ -71,7 +71,15 @@ echo "Do NOT ship credentials.toml, draft.json or usage.json."
 
 if [ "$(uname -s)" = "Darwin" ]; then
     echo
-    echo "The .app is unsigned, so Gatekeeper will block a double-click."
-    echo "Tell recipients to right-click -> Open the first time, or run:"
+    echo "Built for $(lipo -archs dist/Bulklogger.app/Contents/MacOS/Bulklogger)."
+    echo "PyInstaller cannot cross-compile, so this app only runs on Macs with"
+    echo "the same chip as this one. Recipients on the other chip get"
+    echo "\"not supported on this Mac\" - build there too, or use the workflow,"
+    echo "which builds both."
+    echo
+    echo "The .app is unsigned, so Gatekeeper will block a double-click. On"
+    echo "macOS 15+ right-click -> Open no longer works; the first launch has to"
+    echo "be approved in System Settings -> Privacy & Security -> Open Anyway."
+    echo "Simpler, if you trust the sender:"
     echo "    xattr -dr com.apple.quarantine /path/to/Bulklogger.app"
 fi

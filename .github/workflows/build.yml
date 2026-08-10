@@ -33,8 +33,14 @@ jobs:
         include:
           - os: windows-latest
             name: windows
+          # Two Mac builds. PyInstaller cannot cross-compile and the runner's
+          # own Python is single-architecture, so an Apple Silicon runner emits
+          # an arm64-only app that Intel Macs refuse to launch with "not
+          # supported on this Mac" (and vice versa). One runner per chip.
           - os: macos-latest
-            name: macos
+            name: macos-apple-silicon
+          - os: macos-15-intel
+            name: macos-intel
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -88,7 +94,15 @@ jobs:
           cp tickets.toml credentials.toml.example "$stage"/
           # README is optional so a release still builds before one is written
           if [ -f README.md ]; then cp README.md "$stage"/; fi
-          ditto -c -k --sequesterRsrc --keepParent "$stage" "$stage-macos.zip"
+          # Fail the build rather than ship an app for the wrong chip: the
+          # release attaches both zips and only the filename tells them apart.
+          got=$(lipo -archs dist/Bulklogger.app/Contents/MacOS/Bulklogger)
+          want="${{ matrix.name == 'macos-intel' && 'x86_64' || 'arm64' }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::built $got on ${{ matrix.os }}, expected $want"
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "$stage-${{ matrix.name }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -117,9 +131,21 @@ jobs:
           **Windows** — unzip and run `Bulklogger.exe`. Keep `tickets.toml` in the
           same folder.
 
-          **macOS** — unzip, then **right-click → Open** `Bulklogger.app` the first
-          time. The app is unsigned, so a plain double-click is blocked by
-          Gatekeeper. Keep `tickets.toml` in the same folder as the app.
+          **macOS** — pick the zip that matches your chip. Apple menu → About This
+          Mac: an **Apple M-series** chip needs `macos-apple-silicon`, an **Intel**
+          one needs `macos-intel`. The wrong zip fails with "not supported on this
+          Mac".
+
+          Unzip, then approve it once: the app is unsigned, so the first
+          double-click is blocked. On macOS 15 and later, right-click → Open no
+          longer bypasses this — open **System Settings → Privacy & Security**,
+          scroll to **Security**, and click **Open Anyway**. Or, from Terminal:
+
+          ```
+          xattr -dr com.apple.quarantine /path/to/Bulklogger.app
+          ```
+
+          Keep `tickets.toml` in the same folder as the app.
 
           On first run you are asked for your email and a Jira API token, created
           at id.atlassian.com → Security → API tokens. It is saved to
