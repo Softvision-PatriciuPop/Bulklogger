@@ -881,6 +881,7 @@ class TicketPicker(tk.Frame):
         self._rows = []
         self._active = -1
         self._show_retired = False
+        self._reveal = False  # set per-popup in _open; see the note there
 
         self.entry = tk.Entry(self, width=width, **entry_options(fonts))
         self.entry.pack(fill="x")
@@ -931,7 +932,26 @@ class TicketPicker(tk.Frame):
             return
         self._show_retired = False
         popup = tk.Toplevel(self)
+        # macOS/Aqua only honours overrideredirect while the window is still
+        # unmapped, and MacWindowStyle has to be set before it first appears.
+        # Tk 8.6 -- what PyInstaller bundles -- otherwise maps a borderless
+        # window that never draws, so the picker looked empty and dead on Mac
+        # while working fine on Windows. Build it withdrawn and reveal it in
+        # _place, once it has contents and a position.
+        #
+        # Aqua only: on Windows this popup already works, and deiconify there
+        # can pull focus off the entry, which _maybe_close reads as "user left"
+        # and shuts the popup again.
+        self._reveal = self.tk.call("tk", "windowingsystem") == "aqua"
+        if self._reveal:
+            popup.withdraw()
         popup.wm_overrideredirect(True)
+        if self._reveal:
+            try:
+                popup.tk.call("::tk::unsupported::MacWindowStyle", "style",
+                              popup._w, "help", "none")
+            except tk.TclError:
+                pass  # unsupported command, so the plain borderless one stands
         popup.attributes("-topmost", True)
         # a 1px BORDER-coloured frame standing in for a themed window border
         frame = tk.Frame(popup, background=theme.BORDER, padx=1, pady=1)
@@ -970,6 +990,13 @@ class TicketPicker(tk.Frame):
         width = max(self.entry.winfo_width(), 460)
         height = max(self._popup.winfo_reqheight(), 24)
         self._popup.wm_geometry(f"{width}x{height}+{x}+{y}")
+        if self._reveal:
+            # Withdrawn since _open so Aqua applied the borderless style. Show
+            # it now that it is sized and positioned, so it never flashes in
+            # the wrong place. Once only -- _place also runs on every refill.
+            self._reveal = False
+            self._popup.deiconify()
+            self._popup.lift()
 
     def _close(self, _event=None):
         if self._popup:

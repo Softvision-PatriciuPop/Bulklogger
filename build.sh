@@ -71,7 +71,7 @@ echo "Do NOT ship credentials.toml, draft.json or usage.json."
 
 if [ "$(uname -s)" = "Darwin" ]; then
     echo
-    echo "Built for $(lipo -archs dist/Bulklogger.app/Contents/MacOS/Bulklogger)."
+    echo "Built for $(lipo -archs "$TARGET/Contents/MacOS/Bulklogger")."
     echo "PyInstaller cannot cross-compile, so this app only runs on Macs with"
     echo "the same chip as this one. Recipients on the other chip get"
     echo "\"not supported on this Mac\" - build there too, or use the workflow,"

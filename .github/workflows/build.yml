@@ -96,7 +96,8 @@ jobs:
           if [ -f README.md ]; then cp README.md "$stage"/; fi
           # Fail the build rather than ship an app for the wrong chip: the
           # release attaches both zips and only the filename tells them apart.
-          got=$(lipo -archs dist/Bulklogger.app/Contents/MacOS/Bulklogger)
+          bin=dist/Bulklogger.app/Contents/MacOS/Bulklogger
+          got=$(lipo -archs "$bin")
           want="${{ matrix.name == 'macos-intel' && 'x86_64' || 'arm64' }}"
           if [ "$got" != "$want" ]; then
             echo "::error::built $got on ${{ matrix.os }}, expected $want"

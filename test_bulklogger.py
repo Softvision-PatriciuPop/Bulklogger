@@ -530,8 +530,13 @@ class TestReleaseWorkflow(unittest.TestCase):
         from_dist = re.findall(r"dist[/\\][^\s,\"']+", commands)
         self.assertTrue(from_dist, "packaging should copy the built binary")
         for path in from_dist:
-            self.assertRegex(path, r"Bulklogger\.(exe|app)$",
-                             f"{path} is not build output")
+            # The bundle's own Mach-O counts: packaging reads it to check the
+            # build is for the architecture its runner claims. Still rejects
+            # repo files such as dist/tickets.toml, which is the actual guard.
+            self.assertRegex(
+                path,
+                r"Bulklogger\.exe$|Bulklogger\.app(/Contents/MacOS/Bulklogger)?$",
+                f"{path} is not build output")
 
     def test_can_write_releases(self):
         self.assertIn("contents: write", self.body)
