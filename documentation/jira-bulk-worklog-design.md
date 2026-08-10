@@ -339,9 +339,9 @@ from its own directory, so a rebuild never clobbers anyone's token.
 
 **macOS.** `build.sh` produces `dist/Bulklogger.app`. PyInstaller cannot
 cross-compile, so it must run on a Mac; `.github/workflows/build.yml` builds
-both platforms on their own runners and uploads the results, which is how to get
-a Mac build without a Mac. Four things differ and each is handled in code rather
-than left to the build:
+both platforms on their own runners, which is how to get a Mac build without a
+Mac. Four things differ and each is handled in code rather than left to the
+build:
 
 - **Config location.** `sys.executable` inside a bundle is
   `Bulklogger.app/Contents/MacOS/Bulklogger`; writing `credentials.toml` there
@@ -362,6 +362,22 @@ than left to the build:
 The `.app` is unsigned, so Gatekeeper blocks the first double-click; recipients
 right-click → Open once. `build.sh` prints this. Signing would need an Apple
 Developer account and was not pursued.
+
+**CI is manual-only and does not run the tests.** `workflow_dispatch` is the
+only trigger: builds are wanted on demand, not on every commit, and the GUI
+tests need a desktop session which makes them a poor automatic gate. Run
+`python -m unittest test_bulklogger test_app` locally instead. Filling in the
+`version` input additionally publishes a GitHub Release with both zips; leaving
+it blank just leaves artifacts on the run.
+
+**Packaging reads repo files from the root, `dist/` only for the binary.** The
+first version copied `dist/tickets.toml`, which existed locally only because it
+had been put there by hand after each build — on a clean checkout the release
+job died with *"Cannot find path ...\dist\tickets.toml"*. Two changes: the build
+scripts now copy `tickets.toml` into `dist/` so a freshly built folder is
+actually runnable (the app aborts without it), and the packaging step takes
+`tickets.toml` and `credentials.toml.example` from the repo root so it does not
+depend on what a build script happened to leave behind.
 
 **Theme.** `theme.py` (Mono Industrial, carried over from another project)
 supplies the palette, fonts, `clam`-based ttk styling and the DWM dark title

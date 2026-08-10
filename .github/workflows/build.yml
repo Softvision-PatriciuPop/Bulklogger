@@ -1,20 +1,20 @@
-# Builds Bulklogger for Windows and macOS, and publishes them as a release.
+# Builds Bulklogger for Windows and macOS, and optionally publishes a release.
 #
 # PyInstaller cannot cross-compile, so each binary is built on its own runner.
 # This is how to get a macOS build without owning a Mac.
 #
-# Every push builds both and leaves them as downloadable artifacts.
-# To cut a release, either:
-#   * push a tag:  git tag v1.0.0 && git push origin v1.0.0
-#   * or run this workflow from the Actions tab and fill in the version box.
+# MANUAL ONLY. Actions -> build -> Run workflow.
+#   * leave the version box blank  -> just build, download the zips from the
+#     run summary under "Artifacts"
+#   * put a tag in it, e.g. v1.0.0 -> also publish a GitHub Release with both
+#     zips attached (the tag is created for you at the current commit)
+#
+# Tests are not run here; run them locally with:
+#   python -m unittest test_bulklogger test_app
 
 name: build
 
 on:
-  push:
-    branches: [main, master]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
     inputs:
       version:
@@ -26,20 +26,7 @@ permissions:
   contents: write # needed to create the release
 
 jobs:
-  test:
-    # The GUI tests create real Tk windows, so they need a desktop session.
-    # The Windows runner has one; ubuntu would need a virtual display.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: pip install -r requirements.txt
-      - run: python -m unittest test_bulklogger test_app
-
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -61,12 +48,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ github.event.inputs.version }}"
-          if [ -z "$VERSION" ]; then
-            case "$GITHUB_REF" in
-              refs/tags/*) VERSION="$GITHUB_REF_NAME" ;;
-              *)           VERSION="dev-${GITHUB_SHA::7}" ;;
-            esac
-          fi
+          if [ -z "$VERSION" ]; then VERSION="dev-${GITHUB_SHA::7}"; fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build (Windows)
@@ -80,16 +62,17 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
-      # Ship the executable and the shared config, and nothing else. Personal
-      # files are stripped by the build scripts; a CI runner never creates one,
-      # but the explicit file list is the real guarantee.
+      # Only the executable comes out of dist/. tickets.toml and the credentials
+      # example are repo files and are taken from the root, so packaging does
+      # not depend on what the build script happened to leave in dist/.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $stage = "Bulklogger-${{ steps.version.outputs.value }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item dist\Bulklogger.exe, dist\tickets.toml, credentials.toml.example $stage
+          Copy-Item dist\Bulklogger.exe $stage
+          Copy-Item tickets.toml, credentials.toml.example $stage
           # README is optional so a release still builds before one is written
           if (Test-Path README.md) { Copy-Item README.md $stage }
           Compress-Archive -Force -Path $stage -DestinationPath "$stage-windows.zip"
@@ -102,7 +85,7 @@ jobs:
           stage="Bulklogger-${{ steps.version.outputs.value }}"
           mkdir -p "$stage"
           cp -R dist/Bulklogger.app "$stage"/
-          cp dist/tickets.toml credentials.toml.example "$stage"/
+          cp tickets.toml credentials.toml.example "$stage"/
           # README is optional so a release still builds before one is written
           if [ -f README.md ]; then cp README.md "$stage"/; fi
           ditto -c -k --sequesterRsrc --keepParent "$stage" "$stage-macos.zip"
@@ -115,10 +98,8 @@ jobs:
 
   release:
     needs: build
-    # only on a tag push, or a manual run with the version box filled in
-    if: >-
-      startsWith(github.ref, 'refs/tags/') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
+    # only when the version box was filled in
+    if: github.event.inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,7 +137,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.version }}"
-          [ -z "$TAG" ] && TAG="$GITHUB_REF_NAME"
           ls -la artifacts
           gh release create "$TAG" artifacts/*.zip \
             --title "Bulklogger $TAG" \

@@ -38,6 +38,10 @@ $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host ""
 Write-Host "Built $exe ($size MB)" -ForegroundColor Green
 
+# The app aborts without a tickets.toml beside it, so put the shared one there
+# and dist\ is immediately runnable. It holds no secrets.
+Copy-Item (Join-Path $PSScriptRoot "tickets.toml") (Join-Path $PSScriptRoot "dist") -Force
+
 # Running the exe from dist\ writes personal state right next to it, and dist\
 # is the folder people zip up. Strip it, loudly, so a token cannot ride along.
 $personal = @("credentials.toml", "draft.json", "usage.json")

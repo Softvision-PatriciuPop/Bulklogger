@@ -1,5 +1,6 @@
 """Offline logic tests for Bulklogger. Run: python -m unittest -v test_bulklogger"""
 
+import re
 import sys
 import tempfile
 import unittest
@@ -507,6 +508,30 @@ class TestReleaseWorkflow(unittest.TestCase):
     def test_builds_on_both_platforms(self):
         self.assertIn("windows-latest", self.body)
         self.assertIn("macos-latest", self.body)
+
+    def test_runs_only_when_triggered_by_hand(self):
+        triggers = self.body.split("jobs:")[0]
+        self.assertIn("workflow_dispatch", triggers)
+        for automatic in ("on:\n  push", "pull_request", "schedule"):
+            self.assertNotIn(automatic, triggers)
+
+    def test_packaging_takes_repo_files_from_the_root_not_dist(self):
+        """Regression: dist/ holds build output only, so dist/tickets.toml
+        does not exist on a fresh checkout and packaging died on it."""
+        for wrong in ("dist/tickets.toml", r"dist\tickets.toml",
+                      "dist/credentials.toml.example",
+                      r"dist\credentials.toml.example"):
+            self.assertNotIn(wrong, self.body, f"packaging still reads {wrong}")
+
+    def test_only_the_executable_comes_out_of_dist(self):
+        # skip comment lines: prose like "comes out of dist/." is not a path
+        commands = "\n".join(line for line in self.body.splitlines()
+                             if not line.strip().startswith("#"))
+        from_dist = re.findall(r"dist[/\\][^\s,\"']+", commands)
+        self.assertTrue(from_dist, "packaging should copy the built binary")
+        for path in from_dist:
+            self.assertRegex(path, r"Bulklogger\.(exe|app)$",
+                             f"{path} is not build output")
 
     def test_can_write_releases(self):
         self.assertIn("contents: write", self.body)

@@ -41,6 +41,10 @@ pyinstaller \
     --hidden-import theme \
     bulklogger.py
 
+# The app aborts without a tickets.toml beside it, so put the shared one there
+# and dist/ is immediately runnable. It holds no secrets.
+cp tickets.toml dist/
+
 # Running the app from dist/ writes personal state next to it, and dist/ is the
 # folder people zip up. Strip it, loudly, so a token cannot ride along.
 removed=()
