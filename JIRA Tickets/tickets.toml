@@ -1,0 +1,21 @@
+# Bulklogger configuration.
+#
+# Ticket keys only - titles are always fetched live from Jira, so there is no
+# second copy here to go stale. Group labels are yours to choose; they control
+# how the picker groups things and have nothing to do with Jira's hierarchy.
+#
+# No secrets live in this file. The API token is in the OS keyring.
+
+base_url = "https://mozilla-hub.atlassian.net"
+timezone = "Europe/Bucharest"
+
+# Goals that have rotated out. Still selectable, but collapsed under
+# "Past goals" at the bottom of the picker so back-logging stays possible.
+retired = []
+
+[groups]
+# Replace with your real goals. A label can be anything - the parent key is a
+# useful prefix when the children are subtasks of one tracking issue.
+"QATT · Test automation" = [
+  "QATT-85",
+]
