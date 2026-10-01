@@ -28,7 +28,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 import theme
 
@@ -124,6 +124,14 @@ FG_MUTED = theme.MUTED
 FG_ERR = theme.ERROR
 FG_OK = theme.ACCENT
 HEADER_FG = theme.JSON_PROPERTY
+GRID_LINE = theme.BORDER  # the review table's cells sit 1px apart on this
+
+# Review table geometry. The day columns share whatever is left over.
+ISSUE_COL_PX = 210
+TOTAL_COL_PX = 90
+CELL_COMMENT_LINES = 3  # comment lines in a cell before it is ellipsised
+MIN_TABLE_PX = 1000  # the table's width at the window's minimum size
+REVIEW_TAB = 2  # index of the Logged work tab in the notebook
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +418,22 @@ class JiraClient:
             if not batch or start >= int(data.get("total", 0)):
                 return issues
 
-    def fetch_day_worklogs(self, account_id, day, tz):
-        """This account's worklogs for one day, oldest first.
+    def fetch_week_worklogs(self, account_id, monday, tz):
+        """This account's worklogs for the week starting `monday`, oldest first.
 
         Deliberately not limited to the configured tickets: the point of the
         review tab is spotting time logged somewhere unexpected, or not at all.
+
+        A week costs about what a day did: one search over the whole range,
+        then one paged worklog read per issue -- the window is widened, the
+        number of round trips is not multiplied by seven.
         """
+        sunday = monday + timedelta(days=6)
         jql = ('worklogAuthor = currentUser() '
-               f'AND worklogDate = "{day.isoformat()}"')
-        start = datetime(day.year, day.month, day.day, tzinfo=tz)
-        end = start + timedelta(days=1)
+               f'AND worklogDate >= "{monday.isoformat()}" '
+               f'AND worklogDate <= "{sunday.isoformat()}"')
+        start = datetime(monday.year, monday.month, monday.day, tzinfo=tz)
+        end = start + timedelta(days=7)
 
         entries = []
         for issue in self._search(jql):
@@ -430,12 +444,14 @@ class JiraClient:
                 # the author still has to be filtered, the endpoint returns all.
                 if (log.get("author") or {}).get("accountId") != account_id:
                     continue
+                started = log.get("started") or ""
                 entries.append({
                     "key": key,
                     "summary": summary,
                     "seconds": int(log.get("timeSpentSeconds") or 0),
                     "comment": (log.get("comment") or "").strip(),
-                    "started": log.get("started") or "",
+                    "started": started,
+                    "day": worklog_day(started, tz, fallback=monday),
                 })
         entries.sort(key=lambda e: (e["started"], e["key"]))
         return entries
@@ -528,21 +544,46 @@ class DryRunClient:
         })
         return str(self._next_id)
 
-    def fetch_day_worklogs(self, account_id, day, tz):
+    # A week of invented work, so the review tab can be seen working offline.
+    # Keyed by weekday: Monday is 0. Weekends are left out on purpose, which
+    # also exercises the "weekend column only when logged" rule.
+    FAKE_WEEK = {
+        0: [("QATT-85", "Migrate auth service to OIDC", 7200,
+             "Reviewed the auth PR.\nPaired with Anna on retry logic."),
+            ("QATT-91", "Improve CI feedback time", 5400,
+             "Cut the nightly suite runtime.")],
+        1: [("QATT-85", "Migrate auth service to OIDC", 5400,
+             "Token refresh edge case, plus the regression test.")],
+        2: [("QATT-91", "Improve CI feedback time", 14400,
+             "Split the matrix so the slow jobs stop blocking merges.")],
+        3: [("QATT-85", "Migrate auth service to OIDC", 10800,
+             "Rolled OIDC out to staging and watched the error rate."),
+            ("QATT-87", "Flaky login spec", 1800,
+             "Quarantined the flaky spec.")],
+        4: [("QATT-87", "Flaky login spec", 7200,
+             "Root-caused the race in the session fixture.")],
+    }
+
+    def fetch_week_worklogs(self, account_id, monday, tz):
         time.sleep(0.3)
-        stamp = day.isoformat()
-        entries = [e for e in self._logged if e["started"].startswith(stamp)]
-        if not entries and day.weekday() < 5:
-            # a plausible-looking day so the review tab can be seen working
-            entries = [
-                {"key": "QATT-85", "summary": "Migrate auth service to OIDC",
-                 "seconds": 7200, "comment": "Reviewed the auth PR.\n"
-                                             "Paired with Anna on retry logic.",
-                 "started": f"{stamp}T11:00:00.000+0300"},
-                {"key": "QATT-91", "summary": "Improve CI feedback time",
-                 "seconds": 5400, "comment": "Cut the nightly suite runtime.",
-                 "started": f"{stamp}T11:00:00.000+0300"},
-            ]
+        days = [monday + timedelta(days=offset) for offset in range(7)]
+        stamps = tuple(day.isoformat() for day in days)
+        entries = [dict(e) for e in self._logged
+                   if e["started"].startswith(stamps)]
+        real_days = {e["started"][:10] for e in entries}
+
+        for offset, day in enumerate(days):
+            if day.isoformat() in real_days:
+                continue  # never invent work on a day the session wrote to
+            for key, summary, seconds, comment in self.FAKE_WEEK.get(offset, ()):
+                entries.append({
+                    "key": key, "summary": summary, "seconds": seconds,
+                    "comment": comment,
+                    "started": f"{day.isoformat()}T11:00:00.000+0300"})
+
+        for entry in entries:
+            entry.setdefault("summary", self.FAKE_TITLES[0])
+            entry["day"] = worklog_day(entry["started"], tz, fallback=monday)
         return sorted(entries, key=lambda e: (e["started"], e["key"]))
 
 
@@ -569,6 +610,13 @@ created = {created}
 """
 
 TOKEN_STALE_DAYS = 330  # ~11 months: close enough to a yearly expiry to warn
+TOKEN_LIFESPAN_YEARS = 1  # tokens are created with a one-year expiry
+
+# Severity of the stored token's age, worst last.
+TOKEN_OK, TOKEN_STALE, TOKEN_EXPIRED = "ok", "stale", "expired"
+TOKEN_COLOURS = {TOKEN_OK: FG_MUTED,
+                 TOKEN_STALE: theme.WARNING,
+                 TOKEN_EXPIRED: theme.ERROR}
 
 
 @dataclass
@@ -617,18 +665,67 @@ def _created_date(value):
         return ""
 
 
-def describe_token_age(created):
-    """(text, stale) for the header. Empty text when the date is unknown."""
-    if not created:
-        return "", False
+def _parse_created(created):
     try:
-        age = (date.today() - date.fromisoformat(created)).days
+        return date.fromisoformat(str(created).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def token_expiry(created):
+    """The day the token is expected to stop working, or None if unknown.
+
+    An anniversary, not created + 365 days: Atlassian dates the expiry a
+    calendar year out, so a token added on 29 February is the only awkward
+    case. It resolves to 28 February, which errs a day early -- the point of
+    this whole feature is to warn *before* a submit fails.
+    """
+    day = _parse_created(created)
+    if day is None:
+        return None
+    year = day.year + TOKEN_LIFESPAN_YEARS
+    try:
+        return day.replace(year=year)
     except ValueError:
-        return "", False
-    if age >= TOKEN_STALE_DAYS:
-        months = max(age // 30, 1)
-        return f"token added {created} · {months} months ago, may expire soon", True
-    return f"token added {created}", False
+        return day.replace(year=year, month=2, day=28)
+
+
+def token_severity(created, today=None):
+    """TOKEN_OK / TOKEN_STALE / TOKEN_EXPIRED for a stored creation date."""
+    day, expiry = _parse_created(created), token_expiry(created)
+    if expiry is None:
+        return TOKEN_OK
+    today = today or date.today()
+    if today >= expiry:
+        return TOKEN_EXPIRED
+    if (today - day).days >= TOKEN_STALE_DAYS:
+        return TOKEN_STALE
+    return TOKEN_OK
+
+
+def describe_token_age(created, today=None):
+    """(text, severity) for the header. Empty text when the date is unknown."""
+    expiry = token_expiry(created)
+    if expiry is None:
+        return "", TOKEN_OK
+    severity = token_severity(created, today)
+    if severity == TOKEN_EXPIRED:
+        return f"token expired {expiry.isoformat()} · sign out to replace it", severity
+    if severity == TOKEN_STALE:
+        return f"token added {created} · expires {expiry.isoformat()}", severity
+    return f"token added {created}", severity
+
+
+def token_expiry_warning(created, today=None):
+    """The startup nag, or "" while the token still has life in it."""
+    expiry = token_expiry(created)
+    if expiry is None or token_severity(created, today) != TOKEN_EXPIRED:
+        return ""
+    return (f"The API token saved on {created} was created with a one-year "
+            f"expiry, so Atlassian considers it expired as of "
+            f"{expiry.isoformat()}.\n\nCreate a new token at "
+            "id.atlassian.com -> Security -> API tokens, then use Sign out to "
+            "enter it. Logging will continue until Jira rejects it.")
 
 
 def store_credentials(email, token):
@@ -710,6 +807,122 @@ def format_duration(seconds):
     if hours:
         return f"{hours}h"
     return f"{minutes}m"
+
+
+def monday_of(day):
+    """The ISO week containing `day` starts here."""
+    return day - timedelta(days=day.weekday())
+
+
+def worklog_day(started, tz, fallback=None):
+    """Which local day a worklog belongs to.
+
+    Jira buckets worklogs by the profile timezone and returns `started` with
+    an explicit offset, so a late entry logged from another zone still has to
+    be converted before it can be filed under a column.
+    """
+    try:
+        stamp = datetime.fromisoformat(started)
+    except (ValueError, TypeError):
+        return fallback
+    if stamp.tzinfo is None:
+        return stamp.date()
+    return stamp.astimezone(tz).date()
+
+
+def week_columns(monday, entries):
+    """Mon-Fri, plus whichever weekend days actually have time against them.
+
+    Five columns is the common week and the widest each column can be. A
+    Saturday that was worked still has to appear -- silently dropping it would
+    make the table disagree with Jira.
+    """
+    days = [monday + timedelta(days=offset) for offset in range(5)]
+    logged = {entry.get("day") for entry in entries}
+    for offset in (5, 6):
+        day = monday + timedelta(days=offset)
+        if day in logged:
+            days.append(day)
+    return days
+
+
+@dataclass
+class WeekCell:
+    """One issue's work on one day. Several worklogs collapse into this."""
+    seconds: int = 0
+    comments: tuple = ()
+
+    @property
+    def comment(self):
+        return "\n".join(self.comments)
+
+
+@dataclass
+class WeekRow:
+    key: str
+    summary: str
+    cells: dict          # date -> WeekCell, absent when nothing was logged
+    total: int
+
+
+@dataclass
+class WeekGrid:
+    days: list           # the columns, left to right
+    rows: list           # WeekRow, one per issue
+    day_totals: dict     # date -> seconds, every column present
+    total: int
+
+    @property
+    def is_empty(self):
+        return not self.rows
+
+
+def build_week_grid(monday, entries):
+    """Fold a week of worklogs into the table the review tab draws.
+
+    Rows are ordered by issue key rather than by time: the chronology is
+    already in the columns, and a stable order is what makes two weeks
+    comparable at a glance.
+    """
+    days = week_columns(monday, entries)
+    in_range = set(days)
+
+    by_key = {}
+    for entry in entries:
+        day = entry.get("day")
+        if day not in in_range:
+            continue
+        key = entry["key"]
+        row = by_key.setdefault(key, {"summary": entry.get("summary", ""),
+                                      "cells": {}})
+        if not row["summary"]:
+            row["summary"] = entry.get("summary", "")
+        cell = row["cells"].get(day, WeekCell())
+        comment = (entry.get("comment") or "").strip()
+        row["cells"][day] = WeekCell(
+            seconds=cell.seconds + int(entry.get("seconds") or 0),
+            comments=cell.comments + ((comment,) if comment else ()))
+
+    rows = []
+    for key in sorted(by_key):
+        cells = by_key[key]["cells"]
+        rows.append(WeekRow(key=key, summary=by_key[key]["summary"],
+                            cells=cells,
+                            total=sum(c.seconds for c in cells.values())))
+
+    day_totals = {day: sum(row.cells[day].seconds
+                           for row in rows if day in row.cells)
+                  for day in days}
+    return WeekGrid(days=days, rows=rows, day_totals=day_totals,
+                    total=sum(day_totals.values()))
+
+
+def clamp_text(text, chars):
+    """Flatten to one paragraph and ellipsise, for a fixed-size cell."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= chars or chars <= 1:
+        return flat
+    return flat[:chars - 1].rstrip() + "…"
 
 
 def build_started(day: date, tz) -> str:
@@ -1189,6 +1402,104 @@ class DateField(ttk.Frame):
             self._note_job = None
 
 
+class WeekField(ttk.Frame):
+    """◀ [2026-09-28 → 2026-10-04] ▶ [This week], with a "W40 · this week" note.
+
+    Typing is still per-date -- an ISO date snaps to the week containing it,
+    which is how people actually think about "the week of the 12th". The
+    public surface mirrors DateField so the two read the same at the call
+    site; `value` is the Monday.
+    """
+
+    def __init__(self, master, fonts, on_change=None, label="Week:"):
+        super().__init__(master)
+        self.on_change = on_change
+        self._value = monday_of(date.today())
+        self._note_job = None
+
+        ttk.Label(self, text=label).pack(side="left")
+        ttk.Button(self, text="◀", width=3,
+                   command=lambda: self.shift(-1)).pack(side="left", padx=(6, 2))
+        self.var = tk.StringVar(value=self._span())
+        self.entry = tk.Entry(self, textvariable=self.var, width=24,
+                              justify="center", **entry_options(fonts))
+        self.entry.pack(side="left")
+        self.entry.bind("<Return>", lambda e: self.commit())
+        self.entry.bind("<FocusOut>", lambda e: self.commit())
+        ttk.Button(self, text="▶", width=3,
+                   command=lambda: self.shift(1)).pack(side="left", padx=(2, 6))
+        ttk.Button(self, text="This week", command=self.today).pack(side="left")
+
+        self.note = ttk.Label(self, text="", style="Muted.TLabel")
+        self.note.pack(side="left", padx=(10, 0))
+        self._describe()
+
+    @property
+    def value(self):
+        """The Monday of the selected week."""
+        return self._value
+
+    @property
+    def end(self):
+        return self._value + timedelta(days=6)
+
+    def _span(self):
+        return f"{self._value.isoformat()} → {self.end.isoformat()}"
+
+    def set(self, day, notify=True):
+        """Accepts any day; the week containing it is what gets selected."""
+        monday = monday_of(day)
+        changed = monday != self._value
+        self._value = monday
+        self.var.set(self._span())
+        self._describe()
+        if changed and notify and self.on_change:
+            self.on_change()
+
+    def shift(self, weeks):
+        self.set(self._value + timedelta(weeks=weeks))
+
+    def today(self):
+        self.set(date.today())
+
+    def commit(self):
+        """Re-accepts its own "start → end" rendering, so a no-op edit is safe."""
+        typed = self.var.get().strip().split("→")[0].strip()
+        try:
+            day = date.fromisoformat(typed)
+        except ValueError:
+            self.var.set(self._span())
+            self.note.configure(text="use YYYY-MM-DD", foreground=FG_ERR)
+            self._cancel_note_job()
+            self._note_job = self.after(2500, self._describe)
+            return
+        self.set(day)
+
+    def _describe(self):
+        self._note_job = None
+        weeks = (self._value - monday_of(date.today())).days // 7
+        if weeks == 0:
+            when = "this week"
+        elif weeks == -1:
+            when = "last week"
+        elif weeks == 1:
+            when = "next week"
+        elif weeks < 0:
+            when = f"{-weeks} weeks ago"
+        else:
+            when = f"in {weeks} weeks"
+        self.note.configure(text=f"W{self._value.isocalendar().week:02d} · {when}",
+                            foreground=FG_MUTED)
+
+    def _cancel_note_job(self):
+        if self._note_job:
+            try:
+                self.after_cancel(self._note_job)
+            except Exception:
+                pass
+            self._note_job = None
+
+
 class StickyNote(tk.Frame):
     """Free-text scratchpad. Survives Clear and date changes, never submitted."""
 
@@ -1492,6 +1803,7 @@ class App(tk.Tk):
         self.rows = []
         self.submitting = False
         self.reviewing = False
+        self.review_grid_model = None
         self._loading = True
         self._draft_job = None
         self._resync_job = None
@@ -1504,8 +1816,10 @@ class App(tk.Tk):
         set_window_icon(self)
         title = f"{WINDOW_TITLE} — {cfg.base_url.split('//')[-1]}"
         self.title(title + ("  [DRY RUN]" if dry_run else ""))
-        self.geometry("1020x700")
-        self.minsize(860, 460)
+        # Wide enough for the review table's five day columns to hold a
+        # readable slice of each comment; the log tab is happy either way.
+        self.geometry("1320x760")
+        self.minsize(1040, 520)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_topbar()
@@ -1664,8 +1978,8 @@ class App(tk.Tk):
     def _build_review_tab(self, parent):
         bar = ttk.Frame(parent, padding=(10, 10))
         bar.pack(fill="x")
-        self.review_date = DateField(bar, self.fonts)
-        self.review_date.pack(side="left")
+        self.review_week = WeekField(bar, self.fonts)
+        self.review_week.pack(side="left")
         self.review_btn = ttk.Button(bar, text="Show work logged",
                                      style="Submit.TButton",
                                      command=self.load_logged_work)
@@ -1677,27 +1991,61 @@ class App(tk.Tk):
 
         body = ttk.Frame(parent, padding=(10, 8))
         body.pack(fill="both", expand=True)
-        self.review_view = theme.ScrollableText(
-            body, self.fonts["mono"], foreground=FG_MAIN, wrap="word", height=10)
-        self.review_view.pack(fill="both", expand=True)
 
-        text = self.review_view.text
-        text.tag_configure("key", foreground=HEADER_FG,
-                           font=(*self.fonts["mono"], "bold"))
-        text.tag_configure("summary", foreground=FG_MUTED)
-        text.tag_configure("time", foreground=theme.ACCENT,
-                           font=(*self.fonts["mono"], "bold"))
-        text.tag_configure("comment", foreground=theme.JSON_DEFAULT)
-        text.tag_configure("muted", foreground=FG_MUTED)
-        text.tag_configure("error", foreground=FG_ERR)
-        self._review_message("Pick a date and press Show work logged.")
+        # The table scrolls as one piece, header and totals included: pinning
+        # them outside the canvas would mean keeping three grids' column
+        # widths in sync by hand, for a table that is rarely taller than the
+        # window anyway.
+        self.review_canvas = tk.Canvas(body, highlightthickness=0,
+                                       background=theme.CHROME_BG)
+        review_scroll = ttk.Scrollbar(body, orient="vertical",
+                                      style="Editor.Vertical.TScrollbar",
+                                      command=self.review_canvas.yview)
+        self.review_canvas.configure(yscrollcommand=review_scroll.set)
+        review_scroll.pack(side="right", fill="y")
+        self.review_canvas.pack(side="left", fill="both", expand=True)
+
+        self.review_grid = tk.Frame(self.review_canvas, background=GRID_LINE)
+        self._review_window = self.review_canvas.create_window(
+            (0, 0), window=self.review_grid, anchor="nw")
+        self.review_grid.bind("<Configure>", self._resync_review_scroll)
+        self.review_canvas.bind("<Configure>", self._on_review_resize)
+
+        self.review_detail = ttk.Label(
+            parent, text="", style="Muted.TLabel", anchor="w", justify="left",
+            padding=(12, 6), wraplength=900)
+        self.review_detail.pack(fill="x", side="bottom")
+
+        self._review_message("Pick a week and press Show work logged.")
+
+    def _on_review_resize(self, event):
+        self.review_canvas.itemconfigure(self._review_window, width=event.width)
+        self.review_detail.configure(wraplength=max(event.width - 40, 200))
+        self._resync_review_scroll()
+
+    def _resync_review_scroll(self, _event=None):
+        bbox = self.review_canvas.bbox("all")
+        if not bbox:
+            return
+        viewport = self.review_canvas.winfo_height()
+        self.review_canvas.configure(
+            scrollregion=(0, 0, bbox[2], max(bbox[3], viewport)))
 
     def _on_wheel(self, event):
         # Only reached when the pointer is outside an open picker, since the
         # popup breaks the event. The popup is positioned absolutely, so it
         # would hang in mid-air over scrolled content -- close it instead.
         self._close_pickers()
-        self.canvas.yview_scroll(wheel_steps(event), "units")
+        # bind_all means this fires wherever the pointer is, so the visible
+        # tab decides which of the two canvases actually moves.
+        target = (self.review_canvas if self._on_review_tab() else self.canvas)
+        target.yview_scroll(wheel_steps(event), "units")
+
+    def _on_review_tab(self):
+        try:
+            return self.notebook.index(self.notebook.select()) == REVIEW_TAB
+        except (tk.TclError, AttributeError):
+            return False
 
     def _close_pickers(self):
         for row in self.rows:
@@ -1783,9 +2131,8 @@ class App(tk.Tk):
             stored = load_credentials()
         except ConfigError:
             stored = None
-        text, stale = describe_token_age(stored.created if stored else "")
-        self.token_label.configure(
-            text=text, foreground=theme.WARNING if stale else FG_MUTED)
+        text, severity = describe_token_age(stored.created if stored else "")
+        self.token_label.configure(text=text, foreground=TOKEN_COLOURS[severity])
 
     def sign_out(self):
         """Forget the token and sign in again without restarting.
@@ -1872,12 +2219,28 @@ class App(tk.Tk):
 
     # -- logged work -------------------------------------------------------
 
-    def _review_message(self, text, tag="muted"):
-        view = self.review_view.text
-        view.configure(state="normal")
-        view.delete("1.0", "end")
-        view.insert("1.0", text, tag)
-        view.configure(state="disabled")
+    def _clear_review_grid(self):
+        for child in self.review_grid.winfo_children():
+            child.destroy()
+        # Column weights outlive their widgets -- grid_size() still counts a
+        # configured column after its cells are gone. Without this reset, the
+        # sixth column of a week that had a Saturday would go on stretching
+        # across the next five-column week as a phantom.
+        for column in range(self.review_grid.grid_size()[0]):
+            self.review_grid.columnconfigure(column, weight=0, uniform="",
+                                             minsize=0)
+
+    def _review_message(self, text, error=False):
+        """Replace the table with a single line: loading, empty or failed."""
+        self._clear_review_grid()
+        self.review_detail.configure(text="")
+        tk.Label(self.review_grid, text=text, justify="left", anchor="w",
+                 background=theme.EDITOR_BG, font=self.fonts["ui"],
+                 foreground=FG_ERR if error else FG_MUTED,
+                 padx=12, pady=10, wraplength=760).grid(
+                     row=0, column=0, sticky="nsew", padx=1, pady=1)
+        self.review_grid.columnconfigure(0, weight=1)
+        self._resync_review_scroll()
 
     def load_logged_work(self):
         if self.reviewing:
@@ -1885,26 +2248,26 @@ class App(tk.Tk):
         self.reviewing = True
         self.review_btn.configure(state="disabled")
         self.review_total.configure(text="")
-        day = self.review_date.value
-        self._review_message(f"Loading {day.isoformat()}…")
+        monday = self.review_week.value
+        self._review_message(f"Loading the week of {monday.isoformat()}…")
 
-        threading.Thread(target=self._review_worker, args=(day,),
+        threading.Thread(target=self._review_worker, args=(monday,),
                          daemon=True).start()
         self.after(80, self._drain_review)
 
-    def _review_worker(self, day):
+    def _review_worker(self, monday):
         try:
-            entries = self.client.fetch_day_worklogs(
-                self.account_id, day, self.cfg.tz)
-            self._review_queue.put(("ok", day, entries))
+            entries = self.client.fetch_week_worklogs(
+                self.account_id, monday, self.cfg.tz)
+            self._review_queue.put(("ok", monday, entries))
         except JiraError as exc:
-            self._review_queue.put(("err", day, str(exc)))
+            self._review_queue.put(("err", monday, str(exc)))
         except Exception as exc:
-            self._review_queue.put(("err", day, f"Unexpected error: {exc}"))
+            self._review_queue.put(("err", monday, f"Unexpected error: {exc}"))
 
     def _drain_review(self):
         try:
-            kind, day, payload = self._review_queue.get_nowait()
+            kind, monday, payload = self._review_queue.get_nowait()
         except queue.Empty:
             self.after(80, self._drain_review)
             return
@@ -1912,41 +2275,148 @@ class App(tk.Tk):
         self.reviewing = False
         self.review_btn.configure(state="normal")
         if kind == "err":
-            self._review_message(f"Could not load {day.isoformat()}.\n\n{payload}",
-                                 tag="error")
+            self._review_message(
+                f"Could not load the week of {monday.isoformat()}.\n\n{payload}",
+                error=True)
             return
-        self._render_logged_work(day, payload)
+        self._render_logged_work(monday, payload)
 
-    def _render_logged_work(self, day, entries):
-        view = self.review_view.text
-        view.configure(state="normal")
-        view.delete("1.0", "end")
+    def _render_logged_work(self, monday, entries):
+        grid = build_week_grid(monday, entries)
+        self.review_grid_model = grid  # what the tests and the detail strip read
+        self.review_total.configure(
+            text=f"Week total: {format_duration(grid.total)}")
 
-        if not entries:
-            view.insert("end", f"Nothing logged on {day.isoformat()} "
-                               f"({day.strftime('%A')}).", "muted")
-            self.review_total.configure(text="Total: 0m")
-            view.configure(state="disabled")
+        if grid.is_empty:
+            sunday = monday + timedelta(days=6)
+            self._review_message(f"Nothing logged between {monday.isoformat()} "
+                                 f"and {sunday.isoformat()}.")
             return
 
-        total = 0
-        for entry in entries:
-            total += entry["seconds"]
-            view.insert("end", entry["key"], "key")
-            if entry["summary"]:
-                view.insert("end", f"  {entry['summary']}", "summary")
-            view.insert("end", "\n")
-            view.insert("end", f"  {format_duration(entry['seconds'])}\n", "time")
-            comment = entry["comment"] or "(no comment)"
-            for line in comment.splitlines() or [""]:
-                view.insert("end", f"    {line}\n", "comment")
-            view.insert("end", "\n")
+        self._clear_review_grid()
+        self.review_detail.configure(text="Select a cell to read its full comment.")
+        self._draw_week_table(grid)
+        self._resync_review_scroll()
 
-        count = len(entries)
-        view.insert("end", f"{count} {'entry' if count == 1 else 'entries'} "
-                           f"on {day.isoformat()}\n", "muted")
-        view.configure(state="disabled")
-        self.review_total.configure(text=f"Total: {format_duration(total)}")
+    # -- the table ---------------------------------------------------------
+
+    def _cell_chars(self, columns):
+        """How much comment fits in a cell, in characters.
+
+        Measured rather than guessed: the mono font's width changes with the
+        user's DPI, and a wrong estimate either clips mid-word or overflows
+        the column.
+        """
+        # Before the first layout the canvas reports 1px wide. Falling back to
+        # the narrowest window we allow keeps the clamp conservative instead
+        # of ellipsising everything to nothing.
+        width = max(self.review_canvas.winfo_width(), MIN_TABLE_PX)
+        per_column = (width - ISSUE_COL_PX - TOTAL_COL_PX) / max(columns, 1)
+        char = max(tkfont.Font(font=self.fonts["mono"]).measure("n"), 1)
+        return max(int(per_column / char) * CELL_COMMENT_LINES, 12)
+
+    def _draw_week_table(self, grid):
+        chars = self._cell_chars(len(grid.days))
+        today = date.today()
+
+        self._table_cell(0, 0, "Issue", header=True)
+        for column, day in enumerate(grid.days, start=1):
+            self._table_cell(0, column, day.strftime("%a %d"), header=True,
+                             accent=(day == today))
+        self._table_cell(0, len(grid.days) + 1, "Week", header=True)
+
+        for row_index, row in enumerate(grid.rows, start=1):
+            self._issue_cell(row_index, row, chars)
+            for column, day in enumerate(grid.days, start=1):
+                self._day_cell(row_index, column, row, day, chars)
+            self._table_cell(row_index, len(grid.days) + 1,
+                             format_duration(row.total), time_text=True)
+
+        footer = len(grid.rows) + 1
+        self._table_cell(footer, 0, "Day total", header=True)
+        for column, day in enumerate(grid.days, start=1):
+            self._table_cell(footer, column,
+                             format_duration(grid.day_totals[day]),
+                             header=True, time_text=True)
+        self._table_cell(footer, len(grid.days) + 1,
+                         format_duration(grid.total), header=True,
+                         time_text=True, accent=True)
+
+        self.review_grid.columnconfigure(0, weight=0, minsize=ISSUE_COL_PX)
+        for column in range(1, len(grid.days) + 1):
+            self.review_grid.columnconfigure(column, weight=1, uniform="day")
+        self.review_grid.columnconfigure(len(grid.days) + 1, weight=0,
+                                         minsize=TOTAL_COL_PX)
+
+    def _table_cell(self, row, column, text, *, header=False, time_text=False,
+                    accent=False):
+        """One box in the grid. The 1px gaps are the grid lines."""
+        if accent:
+            colour = theme.ACCENT
+        elif time_text:
+            colour = FG_MAIN
+        elif header:
+            colour = HEADER_FG
+        else:
+            colour = FG_MUTED
+        font = self.fonts["ui_bold"] if (header or time_text) else self.fonts["ui"]
+        cell = tk.Label(self.review_grid, text=text, anchor="w", justify="left",
+                        background=theme.CHROME_BG if header else theme.EDITOR_BG,
+                        foreground=colour, font=font, padx=8, pady=5)
+        cell.grid(row=row, column=column, sticky="nsew", padx=1, pady=1)
+        return cell
+
+    def _issue_cell(self, row_index, row, chars):
+        box = tk.Frame(self.review_grid, background=theme.EDITOR_BG,
+                       padx=8, pady=5)
+        box.grid(row=row_index, column=0, sticky="nsew", padx=1, pady=1)
+        tk.Label(box, text=row.key, anchor="w", background=theme.EDITOR_BG,
+                 foreground=HEADER_FG, font=self.fonts["ui_bold"]).pack(
+                     fill="x")
+        if row.summary:
+            tk.Label(box, text=clamp_text(row.summary, chars), anchor="w",
+                     justify="left", background=theme.EDITOR_BG,
+                     foreground=FG_MUTED, font=self.fonts["ui"],
+                     wraplength=ISSUE_COL_PX - 20).pack(fill="x")
+
+    def _day_cell(self, row_index, column, row, day, chars):
+        cell = row.cells.get(day)
+        if cell is None:
+            self._table_cell(row_index, column, "—")
+            return
+
+        box = tk.Frame(self.review_grid, background=theme.EDITOR_BG,
+                       padx=8, pady=5)
+        box.grid(row=row_index, column=column, sticky="nsew", padx=1, pady=1)
+        widgets = [box]
+        widgets.append(tk.Label(box, text=format_duration(cell.seconds),
+                                anchor="w", background=theme.EDITOR_BG,
+                                foreground=theme.ACCENT,
+                                font=self.fonts["ui_bold"]))
+        widgets[-1].pack(fill="x")
+        if cell.comment:
+            widgets.append(tk.Label(box, text=clamp_text(cell.comment, chars),
+                                    anchor="w", justify="left",
+                                    background=theme.EDITOR_BG,
+                                    foreground=theme.JSON_DEFAULT,
+                                    font=self.fonts["ui"], wraplength=1))
+            widgets[-1].pack(fill="x")
+            # wraplength needs the column's real width, which Tk only knows
+            # once the grid has been laid out.
+            box.bind("<Configure>", lambda e, label=widgets[-1]:
+                     label.configure(wraplength=max(e.width - 20, 40)))
+
+        for widget in widgets:
+            widget.bind("<Button-1>",
+                        lambda _e, r=row, d=day, c=cell: self._show_cell(r, d, c))
+            widget.configure(cursor="hand2")
+
+    def _show_cell(self, row, day, cell):
+        heading = (f"{row.key} · {day.strftime('%a %d %b')} · "
+                   f"{format_duration(cell.seconds)}")
+        body = cell.comment or "(no comment)"
+        self.review_detail.configure(text=f"{heading}\n{body}",
+                                     foreground=FG_MAIN)
 
     # -- date --------------------------------------------------------------
 
@@ -2105,17 +2575,15 @@ class App(tk.Tk):
         self._draft_job = None
         rows = [row.as_dict() for row in self.rows
                 if not row.is_locked and not row.is_blank]
-        write_json(DRAFT_PATH, {"date": self.selected_date.isoformat(),
-                                "current_work": self.sticky.get(),
+        write_json(DRAFT_PATH, {"current_work": self.sticky.get(),
                                 "rows": rows})
 
     def _load_draft(self):
+        # The date is deliberately not restored: a stale date carried over from
+        # yesterday's session is the easy way to log a day's work onto the wrong
+        # day. Back-dating stays a per-session, explicit choice.
         draft = read_json(DRAFT_PATH, {})
-        try:
-            self.date_field.set(date.fromisoformat(draft.get("date", "")),
-                                notify=False)
-        except ValueError:
-            self.date_field.set(date.today(), notify=False)
+        self.date_field.set(date.today(), notify=False)
         self.sticky.set(draft.get("current_work") or "")
         for data in draft.get("rows", []):
             if isinstance(data, dict):
@@ -2135,7 +2603,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 setattr(self, attr, None)
-        for field in ("date_field", "review_date"):
+        for field in ("date_field", "review_week"):
             widget = getattr(self, field, None)
             if widget is not None:
                 widget._cancel_note_job()
@@ -2312,6 +2780,22 @@ def fatal(root, message):
     sys.exit(1)
 
 
+def warn_if_token_expired(parent):
+    """Nag on the token's first birthday, before a submit fails over it.
+
+    Jira only tells you the token is dead by rejecting a worklog, by which
+    point the user is mid-batch. The stored creation date is enough to say it
+    a day early instead.
+    """
+    try:
+        stored = load_credentials()
+    except ConfigError:
+        return
+    message = token_expiry_warning(stored.created if stored else "")
+    if message:
+        messagebox.showwarning(WINDOW_TITLE, message, parent=parent)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="bulklogger", description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -2351,6 +2835,7 @@ def main(argv=None):
         if client is None:  # cancelled at the sign-in dialog
             root.destroy()
             return 1
+        warn_if_token_expired(root)
 
     # 4-5. ticket list, titles. No network means no titles means no window.
     try:

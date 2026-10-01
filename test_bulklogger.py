@@ -281,20 +281,24 @@ class TestExampleFilesMatchTheParser(unittest.TestCase):
         self.assertIn("QATT-85", cfg.all_keys)
 
 
-class TestFetchDayWorklogs(unittest.TestCase):
+class TestFetchWeekWorklogs(unittest.TestCase):
     """The review tab's query. Network is stubbed at the two seams below."""
+
+    MONDAY = date(2026, 8, 3)
 
     def setUp(self):
         self.tz = bl.ZoneInfo("Europe/Bucharest")
         self.client = bl.JiraClient("https://x.atlassian.net", "e@x", "tok")
         self.jql = None
         self.window = None
+        self.calls = 0
 
         def search(jql):
             self.jql = jql
             return [{"key": "QATT-85", "fields": {"summary": "Auth work"}}]
 
         def worklogs(key, start, end):
+            self.calls += 1
             self.window = (start, end)
             return [
                 {"author": {"accountId": "me"}, "timeSpentSeconds": 7200,
@@ -307,34 +311,193 @@ class TestFetchDayWorklogs(unittest.TestCase):
         self.client._issue_worklogs = worklogs
 
     def run_it(self):
-        return self.client.fetch_day_worklogs("me", date(2026, 8, 7), self.tz)
+        return self.client.fetch_week_worklogs("me", self.MONDAY, self.tz)
 
-    def test_queries_by_author_and_date(self):
+    def test_queries_by_author_and_date_range(self):
         self.run_it()
         self.assertIn("worklogAuthor = currentUser()", self.jql)
-        self.assertIn('worklogDate = "2026-08-07"', self.jql)
+        self.assertIn('worklogDate >= "2026-08-03"', self.jql)
+        self.assertIn('worklogDate <= "2026-08-09"', self.jql)
 
     def test_other_peoples_worklogs_are_excluded(self):
         entries = self.run_it()
         self.assertEqual([e["comment"] for e in entries], ["mine"])
 
-    def test_returns_key_summary_time_and_comment(self):
+    def test_returns_key_summary_time_comment_and_day(self):
         entry = self.run_it()[0]
         self.assertEqual(entry["key"], "QATT-85")
         self.assertEqual(entry["summary"], "Auth work")
         self.assertEqual(entry["seconds"], 7200)
         self.assertEqual(entry["comment"], "mine")
+        self.assertEqual(entry["day"], date(2026, 8, 7))
 
-    def test_window_is_the_local_day(self):
+    def test_window_is_the_local_week(self):
         self.run_it()
         start, end = self.window
-        self.assertEqual(start.isoformat(), "2026-08-07T00:00:00+03:00")
-        self.assertEqual(end.isoformat(), "2026-08-08T00:00:00+03:00")
+        self.assertEqual(start.isoformat(), "2026-08-03T00:00:00+03:00")
+        self.assertEqual(end.isoformat(), "2026-08-10T00:00:00+03:00")
+
+    def test_one_worklog_request_per_issue_not_per_day(self):
+        """A week must not cost seven times a day in round trips."""
+        self.run_it()
+        self.assertEqual(self.calls, 1)
 
     def test_not_limited_to_configured_tickets(self):
         """Spotting time logged somewhere unexpected is the point."""
         self.run_it()
         self.assertNotIn("key in", self.jql)
+
+
+class TestWorklogDay(unittest.TestCase):
+    """Which column a worklog lands in, once the offset is resolved."""
+
+    def setUp(self):
+        self.tz = bl.ZoneInfo("Europe/Bucharest")  # +03:00 in August
+
+    def test_uses_the_configured_zone_not_the_raw_prefix(self):
+        """23:30 UTC on the 6th is already the 7th in Bucharest."""
+        day = bl.worklog_day("2026-08-06T23:30:00.000+0000", self.tz)
+        self.assertEqual(day, date(2026, 8, 7))
+
+    def test_keeps_a_same_zone_stamp_on_its_own_day(self):
+        self.assertEqual(bl.worklog_day("2026-08-07T11:00:00.000+0300", self.tz),
+                         date(2026, 8, 7))
+
+    def test_naive_stamps_are_taken_at_face_value(self):
+        self.assertEqual(bl.worklog_day("2026-08-07T11:00:00", self.tz),
+                         date(2026, 8, 7))
+
+    def test_unparseable_falls_back(self):
+        fallback = date(2026, 8, 3)
+        self.assertEqual(bl.worklog_day("", self.tz, fallback), fallback)
+        self.assertEqual(bl.worklog_day(None, self.tz, fallback), fallback)
+
+
+class TestWeekColumns(unittest.TestCase):
+    MONDAY = date(2026, 8, 3)
+
+    def columns(self, *offsets):
+        entries = [{"day": self.MONDAY + timedelta(days=o)} for o in offsets]
+        return bl.week_columns(self.MONDAY, entries)
+
+    def test_monday_of_snaps_to_the_start_of_the_week(self):
+        for offset in range(7):
+            self.assertEqual(bl.monday_of(self.MONDAY + timedelta(days=offset)),
+                             self.MONDAY)
+
+    def test_weekdays_always_appear_even_when_empty(self):
+        self.assertEqual(self.columns(), [self.MONDAY + timedelta(days=o)
+                                          for o in range(5)])
+
+    def test_saturday_appears_only_when_worked(self):
+        self.assertEqual(len(self.columns(5)), 6)
+        self.assertEqual(self.columns(5)[-1], self.MONDAY + timedelta(days=5))
+
+    def test_sunday_without_saturday_still_appears(self):
+        days = self.columns(6)
+        self.assertEqual(len(days), 6)
+        self.assertEqual(days[-1], self.MONDAY + timedelta(days=6))
+
+    def test_both_weekend_days_keep_their_order(self):
+        days = self.columns(6, 5)
+        self.assertEqual(days[-2:], [self.MONDAY + timedelta(days=5),
+                                     self.MONDAY + timedelta(days=6)])
+
+
+class TestBuildWeekGrid(unittest.TestCase):
+    MONDAY = date(2026, 8, 3)
+
+    def entry(self, key, offset, seconds, comment="", summary="Some work"):
+        day = self.MONDAY + timedelta(days=offset)
+        return {"key": key, "summary": summary, "seconds": seconds,
+                "comment": comment, "day": day,
+                "started": f"{day.isoformat()}T11:00:00.000+0300"}
+
+    def test_an_empty_week_still_has_weekday_columns(self):
+        grid = bl.build_week_grid(self.MONDAY, [])
+        self.assertTrue(grid.is_empty)
+        self.assertEqual(len(grid.days), 5)
+        self.assertEqual(grid.total, 0)
+
+    def test_one_row_per_issue_with_a_cell_per_worked_day(self):
+        grid = bl.build_week_grid(self.MONDAY, [
+            self.entry("QATT-85", 0, 7200, "monday"),
+            self.entry("QATT-85", 2, 3600, "wednesday"),
+            self.entry("QATT-91", 0, 1800, "also monday"),
+        ])
+        self.assertEqual([r.key for r in grid.rows], ["QATT-85", "QATT-91"])
+        row = grid.rows[0]
+        self.assertEqual(sorted(row.cells), [self.MONDAY,
+                                             self.MONDAY + timedelta(days=2)])
+        self.assertEqual(row.cells[self.MONDAY].comment, "monday")
+
+    def test_rows_are_ordered_by_key_not_by_time(self):
+        """Chronology is in the columns; a stable order makes weeks comparable."""
+        grid = bl.build_week_grid(self.MONDAY, [
+            self.entry("QATT-91", 0, 60),
+            self.entry("QATT-85", 4, 60),
+        ])
+        self.assertEqual([r.key for r in grid.rows], ["QATT-85", "QATT-91"])
+
+    def test_same_issue_twice_in_a_day_collapses_into_one_cell(self):
+        grid = bl.build_week_grid(self.MONDAY, [
+            self.entry("QATT-85", 0, 3600, "morning"),
+            self.entry("QATT-85", 0, 1800, "afternoon"),
+        ])
+        cell = grid.rows[0].cells[self.MONDAY]
+        self.assertEqual(cell.seconds, 5400)
+        self.assertEqual(cell.comment, "morning\nafternoon")
+
+    def test_blank_comments_are_not_joined_as_empty_lines(self):
+        grid = bl.build_week_grid(self.MONDAY, [
+            self.entry("QATT-85", 0, 3600, ""),
+            self.entry("QATT-85", 0, 1800, "only this one"),
+        ])
+        self.assertEqual(grid.rows[0].cells[self.MONDAY].comment, "only this one")
+
+    def test_totals_add_up_across_rows_and_columns(self):
+        grid = bl.build_week_grid(self.MONDAY, [
+            self.entry("QATT-85", 0, 7200),
+            self.entry("QATT-85", 1, 3600),
+            self.entry("QATT-91", 0, 1800),
+        ])
+        self.assertEqual(grid.rows[0].total, 10800)
+        self.assertEqual(grid.rows[1].total, 1800)
+        self.assertEqual(grid.day_totals[self.MONDAY], 9000)
+        self.assertEqual(grid.day_totals[self.MONDAY + timedelta(days=1)], 3600)
+        self.assertEqual(grid.total, 12600)
+
+    def test_every_column_has_a_total_even_when_nothing_was_logged(self):
+        grid = bl.build_week_grid(self.MONDAY, [self.entry("QATT-85", 0, 60)])
+        self.assertEqual(sorted(grid.day_totals), grid.days)
+        self.assertEqual(grid.day_totals[self.MONDAY + timedelta(days=3)], 0)
+
+    def test_entries_outside_the_week_are_dropped(self):
+        """A column it cannot be filed under would silently skew the total."""
+        stray = self.entry("QATT-85", 0, 7200)
+        stray["day"] = self.MONDAY - timedelta(days=1)
+        grid = bl.build_week_grid(self.MONDAY, [stray])
+        self.assertTrue(grid.is_empty)
+        self.assertEqual(grid.total, 0)
+
+    def test_a_weekend_entry_brings_its_column_with_it(self):
+        grid = bl.build_week_grid(self.MONDAY,
+                                  [self.entry("QATT-85", 5, 3600, "saturday")])
+        self.assertEqual(len(grid.days), 6)
+        self.assertEqual(grid.total, 3600)
+
+
+class TestClampText(unittest.TestCase):
+    def test_short_text_is_untouched(self):
+        self.assertEqual(bl.clamp_text("brief", 20), "brief")
+
+    def test_newlines_become_spaces(self):
+        self.assertEqual(bl.clamp_text("two\nlines", 20), "two lines")
+
+    def test_long_text_is_ellipsised_within_the_budget(self):
+        clamped = bl.clamp_text("x" * 40, 10)
+        self.assertEqual(len(clamped), 10)
+        self.assertTrue(clamped.endswith("…"))
 
 
 class TestTokenAge(unittest.TestCase):
@@ -345,23 +508,72 @@ class TestTokenAge(unittest.TestCase):
         return bl.describe_token_age(created)
 
     def test_fresh_token_shows_the_date_plainly(self):
-        text, stale = self.describe(3)
+        text, severity = self.describe(3)
         self.assertTrue(text.startswith("token added "))
         self.assertNotIn("expire", text)
-        self.assertFalse(stale)
+        self.assertEqual(severity, bl.TOKEN_OK)
 
     def test_old_token_warns_about_expiry(self):
-        text, stale = self.describe(bl.TOKEN_STALE_DAYS + 5)
-        self.assertIn("may expire soon", text)
-        self.assertTrue(stale)
+        text, severity = self.describe(bl.TOKEN_STALE_DAYS + 5)
+        self.assertIn("expires", text)
+        self.assertEqual(severity, bl.TOKEN_STALE)
 
     def test_boundary_is_inclusive(self):
-        self.assertTrue(self.describe(bl.TOKEN_STALE_DAYS)[1])
-        self.assertFalse(self.describe(bl.TOKEN_STALE_DAYS - 1)[1])
+        self.assertEqual(self.describe(bl.TOKEN_STALE_DAYS)[1], bl.TOKEN_STALE)
+        self.assertEqual(self.describe(bl.TOKEN_STALE_DAYS - 1)[1], bl.TOKEN_OK)
 
     def test_unknown_date_shows_nothing(self):
-        self.assertEqual(bl.describe_token_age(""), ("", False))
-        self.assertEqual(bl.describe_token_age("garbage"), ("", False))
+        self.assertEqual(bl.describe_token_age(""), ("", bl.TOKEN_OK))
+        self.assertEqual(bl.describe_token_age("garbage"), ("", bl.TOKEN_OK))
+
+    def test_every_severity_has_a_colour(self):
+        for severity in (bl.TOKEN_OK, bl.TOKEN_STALE, bl.TOKEN_EXPIRED):
+            self.assertIn(severity, bl.TOKEN_COLOURS)
+
+
+class TestTokenExpiry(unittest.TestCase):
+    """A token lives a calendar year; the warning lands on its birthday."""
+
+    def test_expiry_is_the_anniversary(self):
+        self.assertEqual(bl.token_expiry("2025-10-01"), date(2026, 10, 1))
+
+    def test_leap_day_errs_a_day_early(self):
+        """1 March would be a day late, and late is the failure mode."""
+        self.assertEqual(bl.token_expiry("2024-02-29"), date(2025, 2, 28))
+
+    def test_unknown_dates_have_no_expiry(self):
+        for value in ("", "garbage", None, "2025-13-01"):
+            self.assertIsNone(bl.token_expiry(value))
+
+    def test_expired_exactly_on_the_day(self):
+        self.assertEqual(bl.token_severity("2025-10-01", date(2026, 10, 1)),
+                         bl.TOKEN_EXPIRED)
+
+    def test_not_expired_the_day_before(self):
+        self.assertEqual(bl.token_severity("2025-10-01", date(2026, 9, 30)),
+                         bl.TOKEN_STALE)
+
+    def test_still_expired_long_after(self):
+        self.assertEqual(bl.token_severity("2020-01-01", date(2026, 10, 1)),
+                         bl.TOKEN_EXPIRED)
+
+    def test_header_text_names_the_expiry_day(self):
+        text, severity = bl.describe_token_age("2025-10-01", date(2026, 10, 1))
+        self.assertEqual(severity, bl.TOKEN_EXPIRED)
+        self.assertIn("2026-10-01", text)
+        self.assertIn("expired", text)
+
+    def test_warning_appears_on_the_expiry_day(self):
+        message = bl.token_expiry_warning("2025-10-01", date(2026, 10, 1))
+        self.assertIn("2026-10-01", message)
+        self.assertIn("Sign out", message)
+
+    def test_no_warning_before_expiry(self):
+        self.assertEqual(bl.token_expiry_warning("2025-10-01",
+                                                 date(2026, 9, 30)), "")
+
+    def test_no_warning_without_a_date(self):
+        self.assertEqual(bl.token_expiry_warning(""), "")
 
 
 class TestWheelNormalisation(unittest.TestCase):

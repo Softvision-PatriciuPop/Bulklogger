@@ -344,22 +344,31 @@ class TestClear(AppTestCase):
 
 class TestDraftPersistence(AppTestCase):
     def test_draft_survives_a_restart(self):
-        self.app.shift_date(-2)
         self.fill(0, "QATT-85", "line one\nline two", "2h")
         self.fill(1, "QATT-86", "half typed", None)
         self.app.save_draft()
 
-        expected_date = self.app.selected_date
         self.app.destroy()
         self.app = self.make_app()
 
-        self.assertEqual(self.app.selected_date, expected_date)
         self.assertEqual(self.app.rows[0].key, "QATT-85")
         self.assertEqual(self.app.rows[0].comment.get("1.0", "end-1c"),
                          "line one\nline two")
         self.assertEqual(self.app.rows[0].time_text, "2h")
         self.assertEqual(self.app.rows[1].key, "QATT-86")
         self.assertEqual(self.app.rows[1].state, bl.PARTIAL)
+
+    def test_a_restart_returns_to_today(self):
+        """Back-dating is per-session; a stale date must not come back."""
+        self.app.shift_date(-2)
+        self.fill(0, "QATT-85", "work from two days ago", "2h")
+        self.app.save_draft()
+
+        self.app.destroy()
+        self.app = self.make_app()
+
+        self.assertEqual(self.app.selected_date, bl.date.today())
+        self.assertEqual(self.app.rows[0].key, "QATT-85")
 
     def test_logged_rows_are_not_persisted(self):
         self.fill(0, "QATT-85", "committed work", "1h")
@@ -560,65 +569,227 @@ def wait_for_review(app, timeout=30):
         raise AssertionError("review fetch did not finish within the timeout")
 
 
+class TestWeekField(AppTestCase):
+    """The review tab picks weeks, so every date it is handed snaps to Monday."""
+
+    def field(self):
+        return self.app.review_week
+
+    def test_starts_on_the_current_week(self):
+        self.assertEqual(self.field().value, bl.monday_of(date.today()))
+
+    def test_any_day_snaps_to_its_monday(self):
+        self.field().set(date(2026, 8, 6))  # a Thursday
+        self.assertEqual(self.field().value, date(2026, 8, 3))
+        self.assertEqual(self.field().end, date(2026, 8, 9))
+
+    def test_shift_moves_whole_weeks(self):
+        self.field().set(date(2026, 8, 6))
+        self.field().shift(-1)
+        self.assertEqual(self.field().value, date(2026, 7, 27))
+        self.field().shift(2)
+        self.assertEqual(self.field().value, date(2026, 8, 10))
+
+    def test_this_week_returns_to_today(self):
+        self.field().set(date(2020, 1, 1))
+        self.field().today()
+        self.assertEqual(self.field().value, bl.monday_of(date.today()))
+
+    def test_shows_the_span_it_will_fetch(self):
+        self.field().set(date(2026, 8, 6))
+        self.assertEqual(self.field().var.get(), "2026-08-03 → 2026-08-09")
+
+    def test_committing_its_own_rendering_is_a_no_op(self):
+        """FocusOut fires on the unedited text, which must not be an error."""
+        self.field().set(date(2026, 8, 6))
+        self.field().commit()
+        self.assertEqual(self.field().value, date(2026, 8, 3))
+        self.assertNotIn("YYYY", self.field().note.cget("text"))
+
+    def test_typing_a_mid_week_date_selects_that_week(self):
+        self.field().var.set("2026-08-06")
+        self.field().commit()
+        self.assertEqual(self.field().value, date(2026, 8, 3))
+
+    def test_garbage_is_rejected_and_the_span_restored(self):
+        self.field().set(date(2026, 8, 6))
+        self.field().var.set("not a date")
+        self.field().commit()
+        self.assertEqual(self.field().value, date(2026, 8, 3))
+        self.assertEqual(self.field().var.get(), "2026-08-03 → 2026-08-09")
+        self.assertIn("YYYY-MM-DD", self.field().note.cget("text"))
+
+    def test_the_note_names_the_iso_week(self):
+        self.field().set(date(2026, 8, 6))
+        self.assertIn("W32", self.field().note.cget("text"))
+
+
 class TestLoggedWorkTab(AppTestCase):
+    """A week at a time: issues down the side, days across the top."""
+
+    def cells(self):
+        """Every piece of text the table drew, flattened."""
+        out = []
+        for widget in _walk(self.app.review_grid):
+            try:
+                text = widget.cget("text")
+            except bl.tk.TclError:
+                continue
+            if text:
+                out.append(str(text))
+        return out
+
     def shown(self):
-        return self.app.review_view.text.get("1.0", "end-1c")
+        return "\n".join(self.cells())
+
+    def grid(self):
+        return self.app.review_grid_model
+
+    def load(self, day=None):
+        if day is not None:
+            self.app.review_week.set(day)
+        self.app.load_logged_work()
+        wait_for_review(self.app)
 
     def test_starts_with_an_invitation_not_a_fetch(self):
         self.assertIn("Show work logged", self.shown())
+        self.assertIsNone(self.grid())
 
-    def test_lists_ticket_time_and_comment(self):
-        self.app.review_date.set(date(2026, 8, 6))  # a Thursday
-        self.app.load_logged_work()
-        wait_for_review(self.app)
+    def test_columns_are_the_working_days_of_the_week(self):
+        self.load(date(2026, 8, 6))  # a Thursday, so the week of the 3rd
+        self.assertEqual(self.grid().days,
+                         [date(2026, 8, d) for d in range(3, 8)])
+        for header in ("Mon 03", "Tue 04", "Wed 05", "Thu 06", "Fri 07"):
+            self.assertIn(header, self.cells())
+
+    def test_rows_are_issues_and_cells_carry_time_and_comment(self):
+        self.load(date(2026, 8, 6))
         shown = self.shown()
         self.assertIn("QATT-85", shown)
         self.assertIn("2h", shown)
         self.assertIn("Reviewed the auth PR.", shown)
-        self.assertIn("Paired with Anna on retry logic.", shown)
 
-    def test_shows_a_total(self):
-        self.app.review_date.set(date(2026, 8, 6))
-        self.app.load_logged_work()
-        wait_for_review(self.app)
-        self.assertEqual(self.app.review_total.cget("text"), "Total: 3h 30m")
+        row = next(r for r in self.grid().rows if r.key == "QATT-85")
+        monday = date(2026, 8, 3)
+        self.assertEqual(row.cells[monday].seconds, 7200)
+        self.assertIn("Paired with Anna", row.cells[monday].comment)
 
-    def test_reports_an_empty_day(self):
-        self.app.review_date.set(date(2026, 8, 8))  # a Saturday
-        self.app.load_logged_work()
-        wait_for_review(self.app)
+    def test_shows_a_total_per_day_and_for_the_week(self):
+        self.load(date(2026, 8, 6))
+        grid = self.grid()
+        self.assertEqual(grid.day_totals[date(2026, 8, 3)], 12600)  # 3h 30m
+        self.assertEqual(grid.total, sum(grid.day_totals.values()))
+        self.assertEqual(
+            self.app.review_total.cget("text"),
+            f"Week total: {bl.format_duration(grid.total)}")
+        self.assertIn("Day total", self.cells())
+
+    def test_shows_a_total_per_issue(self):
+        self.load(date(2026, 8, 6))
+        row = next(r for r in self.grid().rows if r.key == "QATT-85")
+        self.assertEqual(row.total, sum(c.seconds for c in row.cells.values()))
+        self.assertIn(bl.format_duration(row.total), self.cells())
+
+    def test_days_without_work_are_marked_not_blank(self):
+        self.load(date(2026, 8, 6))
+        self.assertIn("—", self.cells())
+
+    def test_weekend_columns_appear_only_when_worked(self):
+        monday = bl.monday_of(date.today())
+        self.load(monday)
+        self.assertEqual(len(self.grid().days), 5)
+
+        saturday = monday + timedelta(days=5)
+        self.app.client._logged.append(
+            {"key": "QATT-91", "summary": "Weekend", "seconds": 3600,
+             "comment": "pipeline wedged",
+             "started": f"{saturday.isoformat()}T10:00:00.000+0300"})
+        self.load(monday)
+        self.assertEqual(self.grid().days[-1], saturday)
+        self.assertIn(saturday.strftime("%a %d"), self.cells())
+
+    def test_reports_an_empty_week(self):
+        self.app.client.fetch_week_worklogs = lambda *a, **k: []
+        self.load(date(2026, 8, 6))
         self.assertIn("Nothing logged", self.shown())
-        self.assertEqual(self.app.review_total.cget("text"), "Total: 0m")
+        self.assertEqual(self.app.review_total.cget("text"), "Week total: 0m")
 
     def test_surfaces_errors_instead_of_crashing(self):
         def boom(*_args, **_kwargs):
             raise bl.JiraError("Jira returned a server error (500).", status=500)
 
-        self.app.client.fetch_day_worklogs = boom
-        self.app.load_logged_work()
-        wait_for_review(self.app)
+        self.app.client.fetch_week_worklogs = boom
+        self.load()
         self.assertIn("server error", self.shown())
         self.assertEqual(str(self.app.review_btn.cget("state")), "normal")
 
-    def test_view_is_read_only(self):
-        self.app.review_date.set(date(2026, 8, 6))
-        self.app.load_logged_work()
-        wait_for_review(self.app)
-        self.assertEqual(str(self.app.review_view.text.cget("state")), "disabled")
+    def test_selecting_a_cell_shows_its_full_comment(self):
+        """Cells clamp to fit the column; the whole comment lives below."""
+        self.load(date(2026, 8, 6))
+        row = next(r for r in self.grid().rows if r.key == "QATT-85")
+        monday = date(2026, 8, 3)
+        self.app._show_cell(row, monday, row.cells[monday])
 
-    def test_its_date_is_independent_of_the_log_tab(self):
+        detail = self.app.review_detail.cget("text")
+        self.assertIn("QATT-85", detail)
+        self.assertIn("Mon 03 Aug", detail)
+        self.assertIn("Paired with Anna on retry logic.", detail)
+
+    def test_a_long_comment_is_clamped_in_the_cell_but_not_in_the_detail(self):
+        monday = bl.monday_of(date.today())
+        long_comment = "wedged on a stuck runner " * 12
+        self.app.client._logged.append(
+            {"key": "QATT-91", "summary": "Long one", "seconds": 3600,
+             "comment": long_comment,
+             "started": f"{monday.isoformat()}T10:00:00.000+0300"})
+        self.load(monday)
+
+        self.assertFalse(any(long_comment.strip() == c for c in self.cells()))
+        row = next(r for r in self.grid().rows if r.key == "QATT-91")
+        self.app._show_cell(row, monday, row.cells[monday])
+        self.assertIn(long_comment.strip(),
+                      self.app.review_detail.cget("text"))
+
+    def test_its_week_is_independent_of_the_log_tab(self):
         self.app.shift_date(-4)
-        self.assertEqual(self.app.review_date.value, date.today())
+        self.assertEqual(self.app.review_week.value, bl.monday_of(date.today()))
 
     def test_newly_submitted_work_shows_up(self):
         self.fill(0, "QATT-87", "just logged this", "25m")
         self.app.submit()
         wait_for_submit(self.app)
 
-        self.app.review_date.set(self.app.selected_date)
-        self.app.load_logged_work()
-        wait_for_review(self.app)
+        self.load(self.app.selected_date)
         self.assertIn("just logged this", self.shown())
+
+    def test_a_narrower_week_does_not_leave_a_phantom_column(self):
+        """Column weights outlive their widgets unless they are cleared."""
+        monday = bl.monday_of(date.today())
+        saturday = monday + timedelta(days=5)
+        self.app.client._logged.append(
+            {"key": "QATT-91", "summary": "Weekend", "seconds": 3600,
+             "comment": "pipeline wedged",
+             "started": f"{saturday.isoformat()}T10:00:00.000+0300"})
+        self.load(monday)
+        self.assertEqual(len(self.grid().days), 6)
+
+        self.app.client._logged.clear()
+        self.load(monday)
+        self.assertEqual(len(self.grid().days), 5)
+        # Columns 0..6 are issue + five days + week total. Anything configured
+        # beyond that is left over from the six-day week and would reserve
+        # dead space on the right.
+        grid = self.app.review_grid
+        for column in range(7, grid.grid_size()[0]):
+            config = grid.columnconfigure(column)
+            self.assertEqual(config.get("weight"), 0, f"column {column}")
+            self.assertEqual(config.get("minsize"), 0, f"column {column}")
+
+    def test_a_reload_replaces_the_table_rather_than_appending(self):
+        self.load(date(2026, 8, 6))
+        first = len(self.cells())
+        self.load(date(2026, 8, 6))
+        self.assertEqual(len(self.cells()), first)
 
 
 class TestSignOut(AppTestCase):
@@ -660,6 +831,37 @@ class TestSignOut(AppTestCase):
         self.app = self.make_app(dry_run=False)
         self.assertIn(f"token added {date.today().isoformat()}",
                       self.app.token_label.cget("text"))
+
+    def write_credentials(self, created):
+        bl.CREDENTIALS_PATH.write_text(
+            bl.CREDENTIALS_TEMPLATE.format(app=bl.APP_NAME,
+                                           email='"me@mozilla.com"',
+                                           token='"tok"',
+                                           created=f'"{created}"'),
+            encoding="utf-8")
+        self.addCleanup(bl.CREDENTIALS_PATH.unlink, True)
+
+    def test_expired_token_is_called_out_in_red(self):
+        created = date.today() - timedelta(days=400)
+        self.write_credentials(created.isoformat())
+        self.app.destroy()
+        self.app = self.make_app(dry_run=False)
+
+        text = self.app.token_label.cget("text")
+        self.assertIn("expired", text)
+        self.assertIn(bl.token_expiry(created.isoformat()).isoformat(), text)
+        self.assertEqual(str(self.app.token_label.cget("foreground")),
+                         bl.theme.ERROR)
+
+    def test_ageing_token_is_amber_not_red(self):
+        created = date.today() - timedelta(days=bl.TOKEN_STALE_DAYS + 1)
+        self.write_credentials(created.isoformat())
+        self.app.destroy()
+        self.app = self.make_app(dry_run=False)
+
+        self.assertIn("expires", self.app.token_label.cget("text"))
+        self.assertEqual(str(self.app.token_label.cget("foreground")),
+                         bl.theme.WARNING)
 
     def test_token_date_is_blank_when_there_is_no_credentials_file(self):
         self.assertEqual(self.app.token_label.cget("text"), "")

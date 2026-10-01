@@ -17,7 +17,7 @@ The set of loggable issues is small (~25) and stable for ~6 months at a time, be
 
 These were considered and deliberately excluded. Do not add them.
 
-- **No "what's already logged today" view.** The user has a Jira dashboard for this. *(Reversed on 7 August 2026 — see §17, "Logged work tab". The rationale below still holds for the log-entry screen; what was added is a separate tab for auditing past days, which is a different job.)*
+- **No "what's already logged today" view.** The user has a Jira dashboard for this. *(Reversed on 7 August 2026 — see §17, "Logged work tab", and §17.1 where it became a weekly table. The rationale below still holds for the log-entry screen; what was added is a separate tab for auditing past work, which is a different job.)*
 - **No timer / stopwatch.** Entries are typed after the fact.
 - **No daily hours target or under-logging warning.** A running total is displayed, but nothing is validated against it.
 - **No bulk worklog endpoint.** A private one exists but requires ASAP service-to-service auth and is inaccessible to normal integrations. One HTTP request per row is correct and expected.
@@ -206,7 +206,7 @@ Once selected, the row displays `PROJ-4471 · Migrate auth service to OIDC`, tru
 
 ## 10. Date handling
 
-- One date picker for the **entire batch**, not per row. Defaults to today.
+- One date picker for the **entire batch**, not per row. Defaults to today, on every launch (§12).
 - Back-dating is the primary reason it exists (catching up on a forgotten day). Weekends and future dates are permitted without warning.
 - **Changing the date preserves all typed, unsubmitted content.** This is a hard requirement — the user must be able to switch days without retyping.
 - **Changing the date discards `logged` rows.** Their work is already committed to Jira, so nothing is lost, and it prevents a row locked against 6 August from sitting in a batch now targeting 7 August. Only `logged` rows are removed; `empty`, `partial`, `ready` and `failed` rows all persist across the change.
@@ -246,7 +246,9 @@ There is no transactional bulk endpoint, so partial failure is a first-class con
 
 Three separate concerns, all under `~/.local/share/jira-logger/`:
 
-**Draft** (`draft.json`) — a *single* working draft, not one per date. Holds the selected date and every unlocked row's raw field contents. Written on a short debounce after typing stops, and again on window close. Restored at startup. `logged` rows are not persisted; their work is already in Jira.
+**Draft** (`draft.json`) — a *single* working draft, not one per date. Holds every unlocked row's raw field contents and the Current work note. Written on a short debounce after typing stops, and again on window close. Restored at startup. `logged` rows are not persisted; their work is already in Jira.
+
+**The selected date is deliberately *not* part of the draft.** Every launch starts on today. Back-dating stays a per-session, explicit choice: carrying yesterday's date into a new session is the easy way to file a day's work against the wrong day, and the cost of that mistake is far higher than re-clicking ◀ when you genuinely are back-filling.
 
 **Usage** (`usage.json`) — maps ticket key → ISO timestamp of last successful log. Drives the picker's default ordering (§9). Updated on each successful POST.
 
@@ -495,12 +497,37 @@ the keyboard hint, `Clear` and `Submit`.
 **Token age in the header.** `credentials.toml` records a `created` date, shown
 next to the signed-in account as "token added 2026-06-26". Atlassian tokens
 expire on roughly a yearly cycle, and the failure mode without this is a
-mystifying 401 on a day when nothing changed. Past `TOKEN_STALE_DAYS` (330, ~11
-months) the label turns amber and adds "may expire soon", turning a surprise
-into a warning. Credentials written before the field existed fall back to the
-file's modification time, so upgrading users see a sensible date rather than a
-blank. `load_credentials` returns a `Credentials` dataclass now that there are
-three fields rather than two.
+mystifying 401 on a day when nothing changed. Credentials written before the
+field existed fall back to the file's modification time, so upgrading users see
+a sensible date rather than a blank. `load_credentials` returns a `Credentials`
+dataclass now that there are three fields rather than two.
+
+**Three token states, from one stored date.** `token_severity` grades the
+stored `created` date, and the header's colour follows (`TOKEN_COLOURS`):
+
+| State | When | Header |
+| --- | --- | --- |
+| `TOKEN_OK` | less than `TOKEN_STALE_DAYS` (330, ~11 months) old | `token added 2026-06-26`, muted |
+| `TOKEN_STALE` | past 330 days, before the anniversary | `token added 2026-06-26 · expires 2027-06-26`, amber |
+| `TOKEN_EXPIRED` | on or after the anniversary | `token expired 2027-06-26 · sign out to replace it`, red |
+
+`token_expiry` is an *anniversary*, not `created + 365 days`: tokens are issued
+with a one-year lifespan and a calendar year is what Atlassian means by that.
+A token created on 29 February resolves to 28 February, deliberately a day
+early — every tie in this feature breaks towards warning sooner, because the
+cost of warning early is one ignored line of text and the cost of warning late
+is a failed submit mid-batch.
+
+**The expiry day gets a modal, not just a colour.** On the day the token turns
+a year old, `warn_if_token_expired` raises a dialog at startup (next to the
+timezone check in `main`), naming the date and pointing at Sign out. A header
+label that changes colour is easy to miss when you open the app to type three
+rows and leave; the whole point is to intercept the user *before* the batch,
+since Jira's own signal is a 401 that arrives mid-submit. It nags on every
+launch while the token stays expired. Logging is **not** blocked: the stored
+date is a prediction, the token may well have been rotated in Atlassian without
+the app knowing, and refusing to log real work over a guess would be worse than
+the 401 this avoids.
 
 **Personal state must not ship in `dist\`.** Running the exe from its build
 directory writes `credentials.toml`, `draft.json` and `usage.json` beside it —
@@ -513,23 +540,67 @@ sharpest edge.
 
 **Logged work tab.** Reverses §2's "no what's-already-logged view". The original
 reasoning was about the *log-entry screen*, where a read-out would be noise
-during typing. Auditing a past day for a missed or mistaken entry is a separate
-job, and a separate tab keeps them from interfering: it has its own date, so
+during typing. Auditing past work for a missed or mistaken entry is a separate
+job, and a separate tab keeps them from interfering: it has its own period, so
 checking last Tuesday does not disturb the batch being typed.
 
-Query is `worklogAuthor = currentUser() AND worklogDate = "<day>"` to find the
-issues, then `GET /issue/{key}/worklog` per issue bounded by
-`startedAfter`/`startedBefore` in absolute epoch milliseconds. Worklogs by other
-people on the same issues are filtered by `author.accountId`, so the account id
-is now carried on the `App` and refreshed on sign-in.
+Query is `worklogAuthor = currentUser() AND worklogDate >= "<monday>" AND
+worklogDate <= "<sunday>"` to find the issues, then `GET /issue/{key}/worklog`
+per issue bounded by `startedAfter`/`startedBefore` in absolute epoch
+milliseconds. Worklogs by other people on the same issues are filtered by
+`author.accountId`, so the account id is now carried on the `App` and refreshed
+on sign-in.
 
-Two deliberate choices:
+**Not restricted to `tickets.toml`.** Time logged against something unexpected
+is precisely what the tab exists to catch, so scoping it to the configured list
+would hide the most interesting failure.
 
-- **Not restricted to `tickets.toml`.** Time logged against something
-  unexpected is precisely what the tab exists to catch, so scoping it to the
-  configured list would hide the most interesting failure.
-- **Rendered into a read-only text view, not a table.** Worklog comments are
-  multi-line by design (§4), and a Treeview would truncate them to one row.
+### 17.1 A week at a time, as a table
+
+The tab originally showed one day as a read-only text view, on the grounds that
+a Treeview would truncate multi-line comments to one row. Both halves changed:
+the period is now a week, and the view is a real table.
+
+**Why a week.** Logging is a daily habit but reconciling is a weekly one — "did
+I account for all five days" is the question people actually open this tab to
+answer, and a day view makes it five separate lookups with no total.
+
+**A week costs one extra search, not seven.** The JQL widens to a range and the
+per-issue worklog window widens to seven days, so the round-trip count is
+`1 + <distinct issues in the week>` — the same shape as a day, with a slightly
+larger result set. Fetching seven days one at a time would have been 7×.
+
+**Layout** (`build_week_grid`, drawn by `_draw_week_table`):
+
+| | |
+|---|---|
+| Columns | Mon–Fri, plus Saturday or Sunday **only when time was logged there**. Five columns is the common week and the widest each column can be; silently dropping a worked Saturday would make the table disagree with Jira. |
+| Rows | One per issue, **ordered by key**, not by time. The chronology is already in the columns, and a stable order is what makes two weeks comparable at a glance. |
+| Cells | Duration in accent, then the comment clamped to `CELL_COMMENT_LINES`. Empty cells read `—` rather than blank, so "nothing logged" is distinguishable from "failed to render". |
+| Totals | A `Day total` row along the bottom, a `Week` column down the right, and the grand total in both the corner cell and the header bar. |
+
+**Comments are clamped, not dropped.** At the window's minimum width a day
+column is about 150px — roughly 20 characters per line. The full text has to
+live somewhere, so selecting a cell prints it in full in the strip beneath the
+table. `_cell_chars` *measures* the mono font rather than assuming a character
+width, because the right answer changes with the user's DPI; a wrong estimate
+either clips mid-word or overflows the column.
+
+**Several worklogs against one issue on one day collapse into a single cell**,
+times summed and comments joined with a newline. A grid has nowhere else to put
+them, and the detail strip still shows both.
+
+**The window grew to 1320×760 (minimum 1040×520)** to pay for the columns. The
+log tab is indifferent to the extra width — its comment box simply gets wider.
+
+**The header and totals row scroll with the table** rather than being pinned.
+Pinning them means keeping three separate grids' column widths in sync by hand,
+for a table that is rarely taller than the window.
+
+**The mouse wheel now has two possible targets.** It is bound with `bind_all`
+for the log tab's row list, so `_on_wheel` asks the notebook which tab is
+visible before scrolling — otherwise spinning the wheel over the table would
+silently scroll the rows hidden behind it.
 
 It is N+1 requests for N issues, which at 3–6 issues a day is not worth
 optimising, and it runs on a worker thread with the same queue-and-poll pattern
