@@ -586,6 +586,23 @@ table. `_cell_chars` *measures* the mono font rather than assuming a character
 width, because the right answer changes with the user's DPI; a wrong estimate
 either clips mid-word or overflows the column.
 
+**The detail strip is a `tk.Text`, not a `ttk.Label`.** A Label cannot be
+selected with the mouse, and the first thing people do with a week's worth of
+their own worklog comments is paste them into a standup note or a ticket.
+`state="disabled"` is what makes it read-only *and* copyable: it blocks
+editing while leaving selection, `<<Copy>>` and the clipboard untouched. The
+alternative — an editable widget with every key bound to `break` — is more
+code and lets the caret blink in something that cannot be typed into.
+
+`_resize_detail` sizes the strip to its content between `DETAIL_MIN_LINES`
+and `DETAIL_MAX_LINES`, re-running on every canvas resize because wrapping
+changes with the window. It counts *display* lines, so one long wrapped
+comment is measured as the several rows it actually occupies — except before
+the first layout, when Tk reports the widget 1px wide and would wrap every
+word onto its own line; until there is a real width it counts newlines
+instead. `Ctrl+A` is rebound to select the whole comment, since Tk's default
+sends the caret to the start of the line.
+
 **Several worklogs against one issue on one day collapse into a single cell**,
 times summed and comments joined with a newline. A grid has nowhere else to put
 them, and the detail strip still shows both.
@@ -638,3 +655,52 @@ Showing the account in the header is a small side benefit: on a shared machine
 it answers "whose token is this copy using?" at a glance. Jira Cloud often
 withholds `emailAddress`, so it falls back to `displayName`, then to the address
 that was typed at sign-in.
+
+
+## 18. Update notification
+
+The app is handed to colleagues as a zip from GitHub Releases. Nothing tells
+them a newer one exists, so installs drift and bug reports arrive against
+builds that were fixed two releases ago.
+
+`VERSION` is baked into `bulklogger.py`. At startup the app reads
+`/repos/<owner>/<repo>/releases/latest` from the GitHub API and compares
+`tag_name` against it.
+
+**Versions compare as tuples of ints, not strings.** `parse_version` turns
+`v1.4`, `1.4.0` and `V1.4-beta` all into `(1, 4)`. As text, `"1.10"` sorts
+*before* `"1.9"` — which would hide an update rather than announce one, the
+exact failure this feature exists to prevent.
+
+**Every failure is swallowed.** An offline laptop, a VPN that blocks
+github.com, an unauthenticated rate limit, a malformed tag: all return `""`
+and are indistinguishable from "you are up to date". This runs unattended at
+startup and nothing about it is load-bearing, so there is never an error for
+the user to dismiss. The check is also threaded and polled through a queue,
+like the submit and review fetches, so a blackholed github.com cannot delay
+the window appearing.
+
+**It is gated on a stored token.** That is the cheapest proxy for "this is a
+working install, not a first run" — someone still typing their email into the
+sign-in dialog has no use for release news.
+
+**A banner, not a modal.** It is packed into the empty left side of the top
+bar, in accent, and opens the releases page when clicked. Unlike an expired
+token (§17), an outdated build breaks nothing, so it does not earn a dialog
+that has to be dismissed on every launch. An up-to-date install shows nothing
+at all rather than a reassuring "you are current" line it would have to look
+past every day.
+
+**`--dry-run` fakes a newer release** (`DRY_RUN_RELEASE`) instead of reaching
+the network, so the banner stays demonstrable offline. This matches how dry
+run already invents ticket titles and a week of worklogs.
+
+**CI refuses to tag a release whose version does not match the code.** The
+whole mechanism inverts if they drift: tagging `v1.5` while the code still
+says `1.4` would leave everyone on the newest build staring at a banner
+telling them to download the build they are already running. The release
+workflow extracts `VERSION` and fails the run if it disagrees with the tag.
+
+The version is also in the window title, so "what version are you on?" has an
+answer that does not need a rebuild.
+

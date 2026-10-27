@@ -730,7 +730,7 @@ class TestLoggedWorkTab(AppTestCase):
         monday = date(2026, 8, 3)
         self.app._show_cell(row, monday, row.cells[monday])
 
-        detail = self.app.review_detail.cget("text")
+        detail = self.app.detail_text()
         self.assertIn("QATT-85", detail)
         self.assertIn("Mon 03 Aug", detail)
         self.assertIn("Paired with Anna on retry logic.", detail)
@@ -747,8 +747,57 @@ class TestLoggedWorkTab(AppTestCase):
         self.assertFalse(any(long_comment.strip() == c for c in self.cells()))
         row = next(r for r in self.grid().rows if r.key == "QATT-91")
         self.app._show_cell(row, monday, row.cells[monday])
-        self.assertIn(long_comment.strip(),
-                      self.app.review_detail.cget("text"))
+        self.assertIn(long_comment.strip(), self.app.detail_text())
+
+    def test_the_detail_strip_is_selectable_and_copyable(self):
+        """Its whole point is pasting a comment into a standup or a ticket."""
+        self.load(date(2026, 8, 6))
+        row = next(r for r in self.grid().rows if r.key == "QATT-85")
+        monday = date(2026, 8, 3)
+        self.app._show_cell(row, monday, row.cells[monday])
+
+        detail = self.app.review_detail
+        detail.tag_add("sel", "1.0", "end-1c")
+        self.assertEqual(detail.get("sel.first", "sel.last"),
+                         self.app.detail_text())
+
+        self.app.clipboard_clear()
+        detail.event_generate("<<Copy>>")
+        self.app.update()
+        self.assertIn("Paired with Anna", self.app.clipboard_get())
+
+    def test_ctrl_a_selects_the_whole_comment(self):
+        self.load(date(2026, 8, 6))
+        row = next(r for r in self.grid().rows if r.key == "QATT-85")
+        monday = date(2026, 8, 3)
+        self.app._show_cell(row, monday, row.cells[monday])
+
+        self.app._select_all_detail()
+        detail = self.app.review_detail
+        self.assertEqual(detail.get("sel.first", "sel.last"),
+                         self.app.detail_text())
+
+    def test_the_detail_strip_cannot_be_edited(self):
+        self.load(date(2026, 8, 6))
+        before = self.app.detail_text()
+        self.app.review_detail.event_generate("<Key>", keysym="x")
+        self.app.update()
+        self.assertEqual(self.app.detail_text(), before)
+
+    def test_the_detail_strip_grows_for_a_long_comment(self):
+        monday = bl.monday_of(date.today())
+        self.app.client._logged.append(
+            {"key": "QATT-91", "summary": "Long one", "seconds": 3600,
+             "comment": "\n".join(f"line {n}" for n in range(30)),
+             "started": f"{monday.isoformat()}T10:00:00.000+0300"})
+        self.load(monday)
+        short = self.app.review_detail.cget("height")
+
+        row = next(r for r in self.grid().rows if r.key == "QATT-91")
+        self.app._show_cell(row, monday, row.cells[monday])
+        self.assertGreater(self.app.review_detail.cget("height"), short)
+        self.assertLessEqual(self.app.review_detail.cget("height"),
+                             bl.DETAIL_MAX_LINES)
 
     def test_its_week_is_independent_of_the_log_tab(self):
         self.app.shift_date(-4)
@@ -790,6 +839,110 @@ class TestLoggedWorkTab(AppTestCase):
         first = len(self.cells())
         self.load(date(2026, 8, 6))
         self.assertEqual(len(self.cells()), first)
+
+
+def wait_for_update(app, timeout=10):
+    end = time.time() + timeout
+    while app._update_job and time.time() < end:
+        app.update()
+        time.sleep(0.01)
+    app.update()
+
+
+class TestUpdateCheck(AppTestCase):
+    """Startup asks GitHub whether this build is current, quietly."""
+
+    def setUp(self):
+        super().setUp()
+        # Point at a throwaway credentials.toml: the check is gated on one
+        # existing, and the real file must not be touched by a test run.
+        self._orig_creds = bl.CREDENTIALS_PATH
+        bl.CREDENTIALS_PATH = Path(tempfile.mkdtemp()) / "credentials.toml"
+        self.addCleanup(lambda: setattr(bl, "CREDENTIALS_PATH",
+                                        self._orig_creds))
+
+    def sign_in(self):
+        bl.store_credentials("me@mozilla.com", "tok")
+
+    def banner(self):
+        return self.app.update_label.cget("text")
+
+    def is_shown(self):
+        return self.app.update_label.winfo_manager() == "pack"
+
+    def rebuild(self, tag, dry_run=False, signed_in=True):
+        """A fresh app whose background check returns `tag`."""
+        if signed_in:
+            self.sign_in()
+        self._orig_fetch = bl.fetch_latest_release
+        bl.fetch_latest_release = lambda *a, **k: tag
+        self.addCleanup(lambda: setattr(bl, "fetch_latest_release",
+                                        self._orig_fetch))
+        self.app.destroy()
+        self.app = self.make_app(dry_run=dry_run)
+        wait_for_update(self.app)
+
+    def test_a_newer_release_raises_a_banner(self):
+        self.rebuild("v99.9")
+        self.assertTrue(self.is_shown())
+        self.assertIn("v99.9", self.banner())
+        self.assertIn("Update available", self.banner())
+
+    def test_being_current_shows_nothing_at_all(self):
+        """An up-to-date install gets no furniture it has to look past."""
+        self.rebuild(f"v{bl.VERSION}")
+        self.assertFalse(self.is_shown())
+        self.assertEqual(self.banner(), "")
+
+    def test_an_unreachable_github_is_silent(self):
+        self.rebuild("")
+        self.assertFalse(self.is_shown())
+
+    def test_an_older_tag_does_not_offer_a_downgrade(self):
+        self.rebuild("v0.1")
+        self.assertFalse(self.is_shown())
+
+    def test_the_banner_opens_the_releases_page(self):
+        opened = []
+        orig = bl.webbrowser.open
+        bl.webbrowser.open = opened.append
+        self.addCleanup(lambda: setattr(bl.webbrowser, "open", orig))
+
+        self.rebuild("v99.9")
+        self.app.update_label.event_generate("<Button-1>")
+        self.app.update()
+        self.assertEqual(opened, [bl.RELEASES_URL])
+
+    def test_dry_run_shows_the_banner_without_a_network(self):
+        """No network in dry run, but the banner still has to be demonstrable."""
+        def boom(*_a, **_k):
+            raise AssertionError("dry run must not touch the network")
+
+        orig = bl.fetch_latest_release
+        bl.fetch_latest_release = boom
+        self.addCleanup(lambda: setattr(bl, "fetch_latest_release", orig))
+
+        self.app.destroy()
+        self.app = self.make_app(dry_run=True)
+        wait_for_update(self.app)
+        self.assertTrue(self.is_shown())
+
+    def test_the_check_is_skipped_without_a_stored_token(self):
+        """A first-run user is mid-sign-in and has no use for release news."""
+        called = []
+        orig = bl.fetch_latest_release
+        bl.fetch_latest_release = lambda *a, **k: called.append(True) or "v99.9"
+        self.addCleanup(lambda: setattr(bl, "fetch_latest_release", orig))
+
+        self.app.destroy()
+        self.app = self.make_app(dry_run=False)  # no credentials.toml written
+        wait_for_update(self.app)
+        self.assertEqual(called, [])
+        self.assertFalse(self.is_shown())
+
+    def test_the_version_is_in_the_title_bar(self):
+        """So "what version are you on?" has an answer without a rebuild."""
+        self.assertIn(f"v{bl.VERSION}", self.app.title())
 
 
 class TestSignOut(AppTestCase):

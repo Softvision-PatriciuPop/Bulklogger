@@ -49,6 +49,25 @@ jobs:
           python-version: "3.13"
       - run: pip install -r requirements-dev.txt
 
+      # The app compares its baked-in VERSION against the latest release tag
+      # to decide whether to show "update available". Tagging v1.5 while the
+      # code still says 1.4 would leave everyone on the newest build staring
+      # at a banner telling them to download the build they already have.
+      - name: Check VERSION matches the release tag
+        if: github.event.inputs.version != ''
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.version }}"
+          CODE="v$(python -c "import re,pathlib; \
+            print(re.search(r'^VERSION = \"([^\"]+)\"', \
+            pathlib.Path('bulklogger.py').read_text(), re.M).group(1))")"
+          if [ "$TAG" != "$CODE" ]; then
+            echo "::error::Tag $TAG does not match VERSION in bulklogger.py ($CODE)."
+            echo "Bump VERSION and commit before releasing."
+            exit 1
+          fi
+          echo "VERSION $CODE matches tag $TAG"
+
       - name: Work out the version label
         id: version
         shell: bash

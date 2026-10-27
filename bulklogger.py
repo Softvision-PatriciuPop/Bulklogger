@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import webbrowser
 import tomllib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -31,6 +32,13 @@ import tkinter as tk
 from tkinter import font as tkfont, messagebox, ttk
 
 import theme
+
+VERSION = "1.4"  # bump before tagging; the update check compares against it
+GITHUB_REPO = "Softvision-PatriciuPop/Bulklogger"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_TIMEOUT = 6  # a background nicety; never worth delaying startup for
+DRY_RUN_RELEASE = "v99.0"  # so --dry-run can show the banner with no network
 
 APP_NAME = "Bulklogger"          # the product: exe name, file names, docs
 WINDOW_TITLE = "JIRA Bulklogger"  # what the user sees on windows and dialogs
@@ -130,6 +138,8 @@ GRID_LINE = theme.BORDER  # the review table's cells sit 1px apart on this
 ISSUE_COL_PX = 210
 TOTAL_COL_PX = 90
 CELL_COMMENT_LINES = 3  # comment lines in a cell before it is ellipsised
+DETAIL_MIN_LINES = 3  # the detail strip never collapses below this
+DETAIL_MAX_LINES = 10  # ...nor grows past it; a long comment scrolls instead
 MIN_TABLE_PX = 1000  # the table's width at the window's minimum size
 REVIEW_TAB = 2  # index of the Logged work tab in the notebook
 
@@ -726,6 +736,51 @@ def token_expiry_warning(created, today=None):
             f"{expiry.isoformat()}.\n\nCreate a new token at "
             "id.atlassian.com -> Security -> API tokens, then use Sign out to "
             "enter it. Logging will continue until Jira rejects it.")
+
+
+def parse_version(text):
+    """(1, 4) from "v1.4", "1.4.0" or "V1.4-beta". None when unparseable.
+
+    A tuple of ints rather than the string, because "1.10" sorts *before*
+    "1.9" as text and that would hide an update rather than announce one.
+    """
+    match = re.match(r"v?(\d+(?:\.\d+)*)", str(text).strip(), re.IGNORECASE)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def is_newer_release(latest, current=None):
+    """Is `latest` a version this build should be told about?
+
+    Unparseable either side means no: an odd tag on the repo should go
+    unmentioned rather than nag about an upgrade that may not exist.
+    """
+    there = parse_version(latest)
+    here = parse_version(VERSION if current is None else current)
+    if there is None or here is None:
+        return False
+    return there > here
+
+
+def fetch_latest_release(timeout=UPDATE_TIMEOUT):
+    """The newest published tag on GitHub, or "" if it cannot be read.
+
+    Every failure is swallowed deliberately. This runs unattended at startup
+    and nothing about it is load-bearing -- an offline laptop, a VPN that
+    blocks github.com or a rate-limited IP must all be indistinguishable from
+    "you are up to date", never an error the user has to dismiss.
+    """
+    import requests  # imported here so --dry-run works without it
+
+    try:
+        resp = requests.get(RELEASES_API, timeout=timeout,
+                            headers={"Accept": "application/vnd.github+json"})
+        if resp.status_code != 200:
+            return ""
+        return str((resp.json() or {}).get("tag_name") or "")
+    except Exception:
+        return ""
 
 
 def store_credentials(email, token):
@@ -1836,12 +1891,15 @@ class App(tk.Tk):
         self._resync_job = None
         self._queue = queue.Queue()
         self._review_queue = queue.Queue()
+        self._update_queue = queue.Queue()
+        self._update_job = None
+        self.latest_release = ""  # the newest tag seen, "" until one is
 
         self.fonts = theme.apply_theme(self)
         self._style_extras()
 
         set_window_icon(self)
-        title = f"{WINDOW_TITLE} — {cfg.base_url.split('//')[-1]}"
+        title = f"{WINDOW_TITLE} v{VERSION} — {cfg.base_url.split('//')[-1]}"
         self.title(title + ("  [DRY RUN]" if dry_run else ""))
         # Wide enough for the review table's five day columns to hold a
         # readable slice of each comment; the log tab is happy either way.
@@ -1870,6 +1928,7 @@ class App(tk.Tk):
         self.bind_all("<Control-Return>", lambda e: self.submit())
 
         self._load_draft()
+        self.check_for_update()
         self._loading = False
         self.normalize_rows()
         self.refresh()
@@ -1882,6 +1941,8 @@ class App(tk.Tk):
         style.configure("Total.TLabel", foreground=theme.ACCENT,
                         font=(*self.fonts["ui"][:1], 12, "bold"))
         style.configure("Muted.TLabel", foreground=FG_MUTED)
+        style.configure("Update.TLabel", foreground=theme.ACCENT,
+                        font=self.fonts["ui_bold"])
         style.configure("Submit.TButton", font=self.fonts["ui_bold"])
         style.configure("TNotebook", background=theme.CHROME_BG, borderwidth=0,
                         tabmargins=(2, 6, 2, 0))
@@ -1906,6 +1967,14 @@ class App(tk.Tk):
             self.signout_btn.pack(side="right")
             self.token_label.pack(side="right", padx=(0, 12))
             self.account_label.pack(side="right", padx=(0, 12))
+
+        # Packed on the left, where the bar is otherwise empty, and only ever
+        # shown when there is something to say -- an up-to-date install gets
+        # no furniture it has to look past.
+        self.update_label = ttk.Label(bar, text="", style="Update.TLabel",
+                                      cursor="hand2")
+        self.update_label.bind("<Button-1>", lambda _e: self.open_releases())
+
         self._update_account_label()
 
     # -- tab 1: log work ---------------------------------------------------
@@ -2038,17 +2107,68 @@ class App(tk.Tk):
         self.review_grid.bind("<Configure>", self._resync_review_scroll)
         self.review_canvas.bind("<Configure>", self._on_review_resize)
 
-        self.review_detail = ttk.Label(
-            parent, text="", style="Muted.TLabel", anchor="w", justify="left",
-            padding=(12, 6), wraplength=900)
+        # A Text, not a Label: these comments get pasted into standups and
+        # tickets, so they have to be selectable. "disabled" blocks editing
+        # while leaving mouse selection and Ctrl+C working, which is exactly
+        # the read-only-but-copyable behaviour wanted here.
+        self.review_detail = tk.Text(parent, height=DETAIL_MIN_LINES,
+                                     wrap="word", cursor="xterm")
+        theme.style_text(self.review_detail, self.fonts["ui"],
+                         foreground=FG_MAIN)
+        self.review_detail.configure(background=theme.CHROME_BG, padx=12, pady=6)
+        self.review_detail.tag_configure("heading", foreground=HEADER_FG,
+                                         font=self.fonts["ui_bold"])
+        self.review_detail.tag_configure("muted", foreground=FG_MUTED)
+        self.review_detail.bind("<Control-a>", self._select_all_detail)
+        self.review_detail.bind("<Control-A>", self._select_all_detail)
+        self.review_detail.configure(state="disabled")
         self.review_detail.pack(fill="x", side="bottom")
 
         self._review_message("Pick a week and press Show work logged.")
 
     def _on_review_resize(self, event):
         self.review_canvas.itemconfigure(self._review_window, width=event.width)
-        self.review_detail.configure(wraplength=max(event.width - 40, 200))
+        self._resize_detail()  # a narrower window wraps to more lines
         self._resync_review_scroll()
+
+    # -- the detail strip --------------------------------------------------
+
+    def _set_detail(self, *chunks):
+        """Replace the strip's contents from (text, tag) pairs."""
+        widget = self.review_detail
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        for text, tag in chunks:
+            widget.insert("end", text, tag)
+        widget.configure(state="disabled")
+        self._resize_detail()
+
+    def detail_text(self):
+        return self.review_detail.get("1.0", "end-1c")
+
+    def _resize_detail(self):
+        """Grow to fit the comment, within reason; anything longer scrolls.
+
+        Counting *display* lines is what makes this correct once the widget
+        has a width -- one long wrapped comment occupies several rows. Before
+        the first layout Tk reports 1px wide, which would wrap every word onto
+        its own line and peg the strip at its maximum, so fall back to
+        counting newlines until there is a real width to wrap against.
+        """
+        widget = self.review_detail
+        unit = "displaylines" if widget.winfo_width() > 1 else "lines"
+        try:
+            counted = widget.count("1.0", "end", unit)
+        except tk.TclError:
+            return
+        lines = counted[0] if counted else DETAIL_MIN_LINES
+        height = max(DETAIL_MIN_LINES, min(lines, DETAIL_MAX_LINES))
+        if height != int(widget.cget("height")):
+            widget.configure(height=height)
+
+    def _select_all_detail(self, _event=None):
+        self.review_detail.tag_add("sel", "1.0", "end-1c")
+        return "break"  # or Tk's own Control-a runs, moving to line start
 
     def _resync_review_scroll(self, _event=None):
         bbox = self.review_canvas.bbox("all")
@@ -2161,6 +2281,49 @@ class App(tk.Tk):
         text, severity = describe_token_age(stored.created if stored else "")
         self.token_label.configure(text=text, foreground=TOKEN_COLOURS[severity])
 
+    # -- updates -----------------------------------------------------------
+
+    def check_for_update(self):
+        """Ask GitHub, in the background, whether this build is current.
+
+        Gated on a stored token because that is what distinguishes someone
+        running the app from someone still setting it up: a first-run user is
+        mid-sign-in and has no use for release news. Threaded and queued
+        rather than inline, so a slow or blackholed github.com delays nothing.
+        """
+        if self.dry_run:
+            # There is no network in dry run, but the banner still has to be
+            # demonstrable, so invent a release that is always newer.
+            self._update_queue.put(DRY_RUN_RELEASE)
+        else:
+            try:
+                if not load_credentials():
+                    return
+            except ConfigError:
+                return
+            threading.Thread(target=self._update_worker, daemon=True).start()
+        self._update_job = self.after(400, self._drain_update)
+
+    def _update_worker(self):
+        self._update_queue.put(fetch_latest_release())
+
+    def _drain_update(self):
+        try:
+            tag = self._update_queue.get_nowait()
+        except queue.Empty:
+            self._update_job = self.after(400, self._drain_update)
+            return
+
+        self._update_job = None
+        self.latest_release = tag
+        if is_newer_release(tag):
+            self.update_label.configure(
+                text=f"Update available: {tag} — click to download")
+            self.update_label.pack(side="left")
+
+    def open_releases(self):
+        webbrowser.open(RELEASES_URL)
+
     def sign_out(self):
         """Forget the token and sign in again without restarting.
 
@@ -2260,7 +2423,7 @@ class App(tk.Tk):
     def _review_message(self, text, error=False):
         """Replace the table with a single line: loading, empty or failed."""
         self._clear_review_grid()
-        self.review_detail.configure(text="")
+        self._set_detail()
         tk.Label(self.review_grid, text=text, justify="left", anchor="w",
                  background=theme.EDITOR_BG, font=self.fonts["ui"],
                  foreground=FG_ERR if error else FG_MUTED,
@@ -2321,7 +2484,7 @@ class App(tk.Tk):
             return
 
         self._clear_review_grid()
-        self.review_detail.configure(text="Select a cell to read its full comment.")
+        self._set_detail(("Select a cell to read its full comment.", "muted"))
         self._draw_week_table(grid)
         self._resync_review_scroll()
 
@@ -2442,8 +2605,8 @@ class App(tk.Tk):
         heading = (f"{row.key} · {day.strftime('%a %d %b')} · "
                    f"{format_duration(cell.seconds)}")
         body = cell.comment or "(no comment)"
-        self.review_detail.configure(text=f"{heading}\n{body}",
-                                     foreground=FG_MAIN)
+        self._set_detail((f"{heading}\n", "heading"),
+                         (body, "" if cell.comment else "muted"))
 
     # -- date --------------------------------------------------------------
 
@@ -2622,7 +2785,7 @@ class App(tk.Tk):
 
     def destroy(self):
         # cancel pending timers so nothing fires against a dead interpreter
-        for attr in ("_draft_job", "_resync_job"):
+        for attr in ("_draft_job", "_resync_job", "_update_job"):
             job = getattr(self, attr, None)
             if job:
                 try:

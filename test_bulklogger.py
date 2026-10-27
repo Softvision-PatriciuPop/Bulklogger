@@ -3,6 +3,7 @@
 import re
 import sys
 import tempfile
+import types
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -574,6 +575,114 @@ class TestTokenExpiry(unittest.TestCase):
 
     def test_no_warning_without_a_date(self):
         self.assertEqual(bl.token_expiry_warning(""), "")
+
+
+class TestVersionParsing(unittest.TestCase):
+    def test_plain_and_v_prefixed_are_the_same(self):
+        self.assertEqual(bl.parse_version("1.4"), (1, 4))
+        self.assertEqual(bl.parse_version("v1.4"), (1, 4))
+        self.assertEqual(bl.parse_version("V1.4"), (1, 4))
+
+    def test_whitespace_and_suffixes_are_tolerated(self):
+        self.assertEqual(bl.parse_version("  v1.4  "), (1, 4))
+        self.assertEqual(bl.parse_version("v1.4-beta.2"), (1, 4))
+
+    def test_any_depth_of_version(self):
+        self.assertEqual(bl.parse_version("v2"), (2,))
+        self.assertEqual(bl.parse_version("v1.4.7"), (1, 4, 7))
+
+    def test_unparseable_is_none(self):
+        for value in ("", "latest", "nightly", None):
+            self.assertIsNone(bl.parse_version(value))
+
+
+class TestIsNewerRelease(unittest.TestCase):
+    """What the startup check decides to tell the user about."""
+
+    def test_a_later_release_is_newer(self):
+        self.assertTrue(bl.is_newer_release("v1.4", "1.3"))
+
+    def test_the_same_release_is_not(self):
+        self.assertFalse(bl.is_newer_release("v1.4", "1.4"))
+
+    def test_an_older_release_is_not(self):
+        """A dev build ahead of the last tag must not be told to downgrade."""
+        self.assertFalse(bl.is_newer_release("v1.3", "1.4"))
+
+    def test_numeric_not_lexical_comparison(self):
+        """"1.10" sorts before "1.9" as text, which would hide the update."""
+        self.assertTrue(bl.is_newer_release("v1.10", "1.9"))
+        self.assertFalse(bl.is_newer_release("v1.9", "1.10"))
+
+    def test_a_deeper_patch_release_is_newer(self):
+        self.assertTrue(bl.is_newer_release("v1.4.1", "1.4"))
+
+    def test_garbage_either_side_says_no(self):
+        """Silence beats nagging about an upgrade that may not exist."""
+        self.assertFalse(bl.is_newer_release("", "1.4"))
+        self.assertFalse(bl.is_newer_release("latest", "1.4"))
+        self.assertFalse(bl.is_newer_release("v1.4", "unreleased"))
+
+    def test_defaults_to_the_baked_in_version(self):
+        self.assertFalse(bl.is_newer_release(f"v{bl.VERSION}"))
+        self.assertTrue(bl.is_newer_release("v999.0"))
+
+
+class TestShippedVersion(unittest.TestCase):
+    def test_version_is_parseable(self):
+        """Everything downstream silently no-ops if this one is malformed."""
+        self.assertIsNotNone(bl.parse_version(bl.VERSION))
+
+    def test_release_urls_point_at_the_repo(self):
+        self.assertIn(bl.GITHUB_REPO, bl.RELEASES_URL)
+        self.assertIn(bl.GITHUB_REPO, bl.RELEASES_API)
+        self.assertTrue(bl.RELEASES_API.startswith("https://api.github.com/"))
+
+
+class TestFetchLatestRelease(unittest.TestCase):
+    """Never raises, never blocks: it runs unattended at startup."""
+
+    def setUp(self):
+        import requests
+        self.requests = requests
+        self._orig = requests.get
+        self.addCleanup(lambda: setattr(requests, "get", self._orig))
+
+    def respond(self, status=200, payload=None, raises=None):
+        def fake_get(url, **kwargs):
+            self.url, self.kwargs = url, kwargs
+            if raises:
+                raise raises
+            return types.SimpleNamespace(status_code=status,
+                                         json=lambda: payload)
+        self.requests.get = fake_get
+
+    def test_returns_the_tag(self):
+        self.respond(payload={"tag_name": "v1.9"})
+        self.assertEqual(bl.fetch_latest_release(), "v1.9")
+        self.assertEqual(self.url, bl.RELEASES_API)
+
+    def test_sends_a_timeout(self):
+        """An unreachable host must not hold the window open."""
+        self.respond(payload={"tag_name": "v1.9"})
+        bl.fetch_latest_release()
+        self.assertTrue(self.kwargs.get("timeout"))
+
+    def test_a_rate_limit_is_silent(self):
+        self.respond(status=403, payload={"message": "rate limited"})
+        self.assertEqual(bl.fetch_latest_release(), "")
+
+    def test_a_missing_tag_is_silent(self):
+        self.respond(payload={})
+        self.assertEqual(bl.fetch_latest_release(), "")
+
+    def test_a_network_failure_is_silent(self):
+        self.respond(raises=OSError("no route to host"))
+        self.assertEqual(bl.fetch_latest_release(), "")
+
+    def test_unparseable_json_is_silent(self):
+        self.respond(raises=ValueError("not json"))
+        self.assertEqual(bl.fetch_latest_release(), "")
 
 
 class TestWheelNormalisation(unittest.TestCase):
